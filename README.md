@@ -21,6 +21,7 @@ mac-tools/
 │       └── macdash.py        # Python TUI dashboard
 └── skills/
     ├── menu-bar/             # Pi/Agent skill to scaffold & install native menu bar apps
+    ├── toggle-sleep/         # Pi/Agent skill to agentically query or toggle sleep states
     └── macdash/              # Pi/Agent skill to run macdash in Herdr / terminal
 ```
 
@@ -53,5 +54,6 @@ An interactive macOS system dashboard showing real-time CPU, RAM, disk, network,
 
 ## Skills
 
+- **`skills/toggle-sleep`**: Agent skill to inspect current sleep status or toggle sleep mode (disable/enable) on demand.
 - **`skills/menu-bar`**: Universal agent skill for scaffolding, compiling, and installing lightweight macOS menu bar utility apps with startup registration.
 - **`skills/macdash`**: Agent skill to launch macdash in a visible Herdr multiplexer terminal pane.
