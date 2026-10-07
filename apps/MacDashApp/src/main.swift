@@ -1,6 +1,7 @@
 import SwiftUI
 import Cocoa
 import Foundation
+import MachO
 import ServiceManagement
 
 // MARK: - Models & Metrics Sampler
@@ -8,7 +9,7 @@ import ServiceManagement
 struct SystemMetrics {
     var cpuUsage: Double = 0.0          // 0 - 100%
     var ramUsedBytes: Double = 0.0
-    var ramTotalBytes: Double = 8 * 1024 * 1024 * 1024
+    var ramTotalBytes: Double = Double(ProcessInfo.processInfo.physicalMemory)
     var swapUsedBytes: Double = 0.0
     var swapTotalBytes: Double = 0.0
     var gpuUsage: Double = 0.0          // 0 - 100%
@@ -31,21 +32,23 @@ struct SystemMetrics {
 
 class MetricsSampler: ObservableObject {
     @Published var metrics = SystemMetrics()
+    @Published var isMonitoringEnabled: Bool = true
     
+    private var lastCpuLoad: host_cpu_load_info?
     private var lastNetRx: Double?
     private var lastNetTx: Double?
     private var lastNetTime: Date?
     private var timer: Timer?
     
     init() {
-        metrics.ramTotalBytes = Double(ProcessInfo.processInfo.physicalMemory)
         sample()
         start()
     }
     
     func start() {
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.sample()
+            guard let self = self, self.isMonitoringEnabled else { return }
+            self.sample()
         }
     }
     
@@ -54,16 +57,16 @@ class MetricsSampler: ObservableObject {
             guard let self = self else { return }
             
             let cpu = self.sampleCPU()
-            let (ramUsed, load) = self.sampleTopSummary()
-            let (swapUsed, swapTotal) = self.sampleSwap()
+            let (ramUsed, load) = self.sampleRAMAndLoad()
+            let (swapUsed, swapTotal) = self.sampleSwapUsage()
             let gpu = self.sampleGPU()
             let (rxRate, txRate) = self.sampleNetwork()
             let thermal = ProcessInfo.processInfo.thermalState
-            let uptime = self.formattedUptime()
+            let uptime = self.sampleUptime()
             
             DispatchQueue.main.async {
                 self.metrics.cpuUsage = cpu
-                if let ram = ramUsed { self.metrics.ramUsedBytes = ram }
+                self.metrics.ramUsedBytes = ramUsed
                 self.metrics.loadAverages = load
                 self.metrics.swapUsedBytes = swapUsed
                 self.metrics.swapTotalBytes = swapTotal
@@ -77,58 +80,34 @@ class MetricsSampler: ObservableObject {
     }
     
     private func sampleCPU() -> Double {
-        var cpuInfo: processor_info_array_t?
-        var numCpuInfo: mach_msg_type_number_t = 0
-        var numProcessors: natural_t = 0
-        
-        let result = host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &numProcessors, &cpuInfo, &numCpuInfo)
-        guard result == KERN_SUCCESS, let cpuInfo = cpuInfo else { return 0.0 }
-        
-        // Return average or fallback to sysctl / top
-        // Free memory allocated by host_processor_info
-        let vmSize = vm_size_t(numCpuInfo) * vm_size_t(MemoryLayout<integer_t>.size)
-        vm_deallocate(mach_task_self_, vm_address_t(bitPattern: cpuInfo), vmSize)
-        
-        // Quick estimate from top summary
-        return sampleTopCPU()
-    }
-    
-    private func sampleTopCPU() -> Double {
-        let task = Process()
-        task.launchPath = "/usr/bin/top"
-        task.arguments = ["-l", "1", "-n", "0"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-        do {
-            try task.run()
-            task.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            if let output = String(data: data, encoding: .utf8) {
-                if let match = output.range(of: "CPU usage: ") {
-                    let rest = output[match.upperBound...]
-                    let comp = rest.components(separatedBy: "%")
-                    if comp.count >= 2 {
-                        let userStr = comp[0].trimmingCharacters(in: .whitespaces)
-                        let sysComp = comp[1].components(separatedBy: "user, ")
-                        if sysComp.count >= 2 {
-                            let sysStr = sysComp[1].trimmingCharacters(in: .whitespaces)
-                            let user = Double(userStr) ?? 0.0
-                            let sys = Double(sysStr) ?? 0.0
-                            return min(100.0, max(0.0, user + sys))
-                        }
-                    }
-                }
+        var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size)
+        var curLoad = host_cpu_load_info()
+        let result = withUnsafeMutablePointer(to: &curLoad) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &count)
             }
-        } catch {}
+        }
+        guard result == KERN_SUCCESS else { return 0.0 }
+        
+        guard let prev = lastCpuLoad else {
+            lastCpuLoad = curLoad
+            return 0.0
+        }
+        
+        lastCpuLoad = curLoad
+        
+        let u = Double(curLoad.cpu_ticks.0 - prev.cpu_ticks.0)
+        let s = Double(curLoad.cpu_ticks.1 - prev.cpu_ticks.1)
+        let i = Double(curLoad.cpu_ticks.2 - prev.cpu_ticks.2)
+        let n = Double(curLoad.cpu_ticks.3 - prev.cpu_ticks.3)
+        let total = u + s + i + n
+        if total > 0 {
+            return min(100.0, max(0.0, ((u + s + n) / total) * 100.0))
+        }
         return 0.0
     }
     
-    private func sampleTopSummary() -> (Double?, (Double, Double, Double)) {
-        var ramUsed: Double? = nil
-        var loads: (Double, Double, Double) = (0.0, 0.0, 0.0)
-        
-        // Sample host_statistics64 for accurate real-time RAM
+    private func sampleRAMAndLoad() -> (Double, (Double, Double, Double)) {
         var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
         var vmStat = vm_statistics64()
         let ret = withUnsafeMutablePointer(to: &vmStat) {
@@ -137,6 +116,7 @@ class MetricsSampler: ObservableObject {
             }
         }
         
+        var ramUsed: Double = 0.0
         if ret == KERN_SUCCESS {
             let pageSize = Double(vm_kernel_page_size)
             let active = Double(vmStat.active_count) * pageSize
@@ -147,41 +127,19 @@ class MetricsSampler: ObservableObject {
         
         var loadavg = [Double](repeating: 0.0, count: 3)
         getloadavg(&loadavg, 3)
-        loads = (loadavg[0], loadavg[1], loadavg[2])
+        let loads = (loadavg[0], loadavg[1], loadavg[2])
         
         return (ramUsed, loads)
     }
     
-    private func sampleSwap() -> (Double, Double) {
-        var size = 0
-        sysctlbyname("vm.swapusage", nil, &size, nil, 0)
-        var buffer = [CChar](repeating: 0, count: size)
-        sysctlbyname("vm.swapusage", &buffer, &size, nil, 0)
-        let str = String(cString: buffer)
-        
-        // total = 3072.00M  used = 1870.81M  free = 1201.19M
-        var usedBytes: Double = 0
-        var totalBytes: Double = 0
-        
-        func parseBytes(_ text: String, key: String) -> Double {
-            if let range = text.range(of: "\(key) = ") {
-                let sub = text[range.upperBound...]
-                let tokens = sub.split(separator: " ")
-                if let first = tokens.first {
-                    let numStr = String(first.filter { "0123456789.".contains($0) })
-                    let num = Double(numStr) ?? 0.0
-                    if first.contains("M") { return num * 1024 * 1024 }
-                    if first.contains("G") { return num * 1024 * 1024 * 1024 }
-                    if first.contains("K") { return num * 1024 }
-                    return num
-                }
-            }
-            return 0
+    private func sampleSwapUsage() -> (Double, Double) {
+        var mib: [Int32] = [CTL_VM, VM_SWAPUSAGE]
+        var swap = xsw_usage()
+        var size = MemoryLayout<xsw_usage>.size
+        if sysctl(&mib, 2, &swap, &size, nil, 0) == 0 {
+            return (Double(swap.xsu_used), Double(swap.xsu_total))
         }
-        
-        usedBytes = parseBytes(str, key: "used")
-        totalBytes = parseBytes(str, key: "total")
-        return (usedBytes, totalBytes)
+        return (0.0, 0.0)
     }
     
     private func sampleGPU() -> Double {
@@ -196,7 +154,6 @@ class MetricsSampler: ObservableObject {
             task.waitUntilExit()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             if let output = String(data: data, encoding: .utf8) {
-                // Find Device Utilization %
                 let pattern = "Device Utilization %\"?=([0-9]+)"
                 if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
                     let range = NSRange(output.startIndex..<output.endIndex, in: output)
@@ -236,9 +193,8 @@ class MetricsSampler: ObservableObject {
             if let output = String(data: data, encoding: .utf8) {
                 let lines = output.components(separatedBy: .newlines)
                 for line in lines {
-                    if line.contains("<Link#") {
+                    if line.contains("<Link#") && !line.hasPrefix("lo0") {
                         let parts = line.split(whereSeparator: { $0.isWhitespace })
-                        // Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll
                         if parts.count >= 10 {
                             if let rx = Double(parts[6]), let tx = Double(parts[9]) {
                                 rxTotal += rx
@@ -269,7 +225,7 @@ class MetricsSampler: ObservableObject {
         return (rxRate, txRate)
     }
     
-    private func formattedUptime() -> String {
+    private func sampleUptime() -> String {
         var bootTime = timeval()
         var size = MemoryLayout<timeval>.size
         var mib: [Int32] = [CTL_KERN, KERN_BOOTTIME]
@@ -287,7 +243,7 @@ class MetricsSampler: ObservableObject {
     }
 }
 
-// MARK: - Helpers & Color Palette
+// MARK: - Formatting & Apple Design Colors
 
 func formatBytes(_ bytes: Double, perSec: Bool = false) -> String {
     let units = ["B", "KB", "MB", "GB", "TB"]
@@ -301,88 +257,77 @@ func formatBytes(_ bytes: Double, perSec: Bool = false) -> String {
     if val >= 100 || unitIndex == 0 {
         return String(format: "%.0f %@", val, units[unitIndex]) + suffix
     } else {
-        return String(format: "%.1f %@", val, units[unitIndex]) + suffix
+        return String(format: "%.2f %@", val, units[unitIndex]) + suffix
     }
 }
 
-func semanticColor(for percent: Double) -> Color {
+func appleSemanticColor(for percent: Double) -> Color {
     switch percent {
     case ..<50:
-        return Color(red: 0.20, green: 0.78, blue: 0.45) // emerald green
+        return Color(nsColor: .systemGreen)
     case 50..<75:
-        return Color(red: 0.23, green: 0.60, blue: 0.98) // vibrant blue
+        return Color(nsColor: .systemBlue)
     case 75..<90:
-        return Color(red: 0.98, green: 0.75, blue: 0.25) // amber
+        return Color(nsColor: .systemOrange)
     default:
-        return Color(red: 0.94, green: 0.33, blue: 0.31) // coral red
+        return Color(nsColor: .systemRed)
     }
 }
 
-// MARK: - Impeccable SwiftUI Dashboard View
+// MARK: - Native Apple Aesthetic HUD Components
 
-struct MetricCard: View {
+struct AppleMetricRow: View {
     let title: String
     let value: String
     let percent: Double
     let icon: String
-    let subtitle: String?
+    let detail: String
+    let isDisabled: Bool
     
-    var color: Color {
-        semanticColor(for: percent)
+    var tintColor: Color {
+        isDisabled ? Color.secondary.opacity(0.4) : appleSemanticColor(for: percent)
     }
     
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
+        VStack(spacing: 5) {
+            HStack(alignment: .firstTextBaseline) {
                 HStack(spacing: 5) {
                     Image(systemName: icon)
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(color)
+                        .foregroundColor(tintColor)
+                        .frame(width: 14)
                     Text(title)
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(.secondary)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(isDisabled ? .secondary.opacity(0.6) : .secondary)
                 }
                 Spacer()
                 Text(value)
-                    .font(.system(size: 12, weight: .bold, design: .monospaced))
-                    .foregroundColor(.primary)
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .foregroundColor(isDisabled ? .secondary.opacity(0.6) : .primary)
             }
             
-            // Meter progress track
+            // Apple-style subtle pill progress track
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(Color.primary.opacity(0.08))
-                        .frame(height: 5)
+                    Capsule()
+                        .fill(Color(nsColor: .separatorColor).opacity(0.35))
+                        .frame(height: 4.5)
                     
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(
-                            LinearGradient(
-                                colors: [color.opacity(0.85), color],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                        )
-                        .frame(width: max(0, min(geo.size.width, geo.size.width * CGFloat(percent / 100.0))), height: 5)
+                    Capsule()
+                        .fill(tintColor)
+                        .frame(width: max(0, min(geo.size.width, geo.size.width * CGFloat(percent / 100.0))), height: 4.5)
                 }
             }
-            .frame(height: 5)
+            .frame(height: 4.5)
             
-            if let sub = subtitle {
-                Text(sub)
-                    .font(.system(size: 9.5, weight: .medium, design: .monospaced))
-                    .foregroundColor(.secondary.opacity(0.8))
+            HStack {
+                Text(detail)
+                    .font(.system(size: 9.5, weight: .regular, design: .monospaced))
+                    .foregroundColor(.secondary)
+                Spacer()
             }
         }
-        .padding(10)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color(NSColor.controlBackgroundColor).opacity(0.65))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.primary.opacity(0.05), lineWidth: 1)
-        )
+        .padding(.vertical, 3)
     }
 }
 
@@ -390,157 +335,158 @@ struct MacDashPopoverView: View {
     @ObservedObject var sampler: MetricsSampler
     
     var thermalColor: Color {
+        guard sampler.isMonitoringEnabled else { return Color.secondary.opacity(0.4) }
         switch sampler.metrics.thermalState {
-        case .nominal: return Color.green
-        case .fair: return Color.blue
-        case .serious: return Color.orange
-        case .critical: return Color.red
-        @unknown default: return Color.green
+        case .nominal: return Color(nsColor: .systemGreen)
+        case .fair: return Color(nsColor: .systemBlue)
+        case .serious: return Color(nsColor: .systemOrange)
+        case .critical: return Color(nsColor: .systemRed)
+        @unknown default: return Color(nsColor: .systemGreen)
         }
     }
     
     var thermalLabel: String {
         switch sampler.metrics.thermalState {
-        case .nominal: return "Nominal (Cool)"
-        case .fair: return "Fair (Warm)"
-        case .serious: return "Serious (Hot)"
-        case .critical: return "Critical (Throttling)"
+        case .nominal: return "Nominal"
+        case .fair: return "Fair"
+        case .serious: return "Elevated"
+        case .critical: return "Throttled"
         @unknown default: return "Nominal"
         }
     }
 
     var body: some View {
-        VStack(spacing: 12) {
-            // Header bar
+        VStack(spacing: 11) {
+            // Header: Apple Control Center style
             HStack {
                 HStack(spacing: 6) {
-                    Image(systemName: "gauge.badge.bolt")
-                        .font(.system(size: 14, weight: .bold))
-                        .foregroundColor(.accentColor)
+                    Image(systemName: "gauge.with.needle.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(sampler.isMonitoringEnabled ? Color(nsColor: .controlAccentColor) : .secondary)
                     Text("MacDash")
-                        .font(.system(size: 14, weight: .bold, design: .default))
+                        .font(.system(size: 13, weight: .bold))
                 }
+                
                 Spacer()
-                HStack(spacing: 4) {
-                    Image(systemName: "clock")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                    Text("Up \(sampler.metrics.uptimeString)")
-                        .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                        .foregroundColor(.secondary)
-                }
+                
+                // Disable / Enable Switch
+                Toggle("", isOn: $sampler.isMonitoringEnabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .labelsHidden()
             }
             .padding(.horizontal, 2)
             
             Divider()
-                .opacity(0.6)
             
-            // Grid of Metrics
-            VStack(spacing: 8) {
-                MetricCard(
+            // Telemetry Sections
+            VStack(spacing: 10) {
+                AppleMetricRow(
                     title: "CPU",
                     value: String(format: "%.1f%%", sampler.metrics.cpuUsage),
                     percent: sampler.metrics.cpuUsage,
                     icon: "cpu",
-                    subtitle: String(format: "Load: %.2f  %.2f  %.2f", sampler.metrics.loadAverages.0, sampler.metrics.loadAverages.1, sampler.metrics.loadAverages.2)
+                    detail: String(format: "Load: %.2f  %.2f  %.2f", sampler.metrics.loadAverages.0, sampler.metrics.loadAverages.1, sampler.metrics.loadAverages.2),
+                    isDisabled: !sampler.isMonitoringEnabled
                 )
                 
-                MetricCard(
-                    title: "RAM",
+                AppleMetricRow(
+                    title: "Memory",
                     value: String(format: "%.1f%%", sampler.metrics.ramPercentage),
                     percent: sampler.metrics.ramPercentage,
                     icon: "memorychip",
-                    subtitle: "\(formatBytes(sampler.metrics.ramUsedBytes)) of \(formatBytes(sampler.metrics.ramTotalBytes))"
+                    detail: "\(formatBytes(sampler.metrics.ramUsedBytes)) of \(formatBytes(sampler.metrics.ramTotalBytes))",
+                    isDisabled: !sampler.isMonitoringEnabled
                 )
                 
-                MetricCard(
-                    title: "SWAP",
-                    value: sampler.metrics.swapTotalBytes > 0 ? String(format: "%.1f%%", sampler.metrics.swapPercentage) : "0.0%",
+                AppleMetricRow(
+                    title: "Swap",
+                    value: String(format: "%.1f%%", sampler.metrics.swapPercentage),
                     percent: sampler.metrics.swapPercentage,
                     icon: "arrow.triangle.2.circlepath",
-                    subtitle: "\(formatBytes(sampler.metrics.swapUsedBytes)) used / \(formatBytes(sampler.metrics.swapTotalBytes)) total"
+                    detail: "\(formatBytes(sampler.metrics.swapUsedBytes)) used / \(formatBytes(sampler.metrics.swapTotalBytes)) total",
+                    isDisabled: !sampler.isMonitoringEnabled
                 )
                 
-                MetricCard(
+                AppleMetricRow(
                     title: "GPU",
                     value: String(format: "%.0f%%", sampler.metrics.gpuUsage),
                     percent: sampler.metrics.gpuUsage,
-                    icon: "sparkles.tv",
-                    subtitle: "Apple Silicon Metal Acceleration"
+                    icon: "display",
+                    detail: "Apple Silicon Metal Acceleration",
+                    isDisabled: !sampler.isMonitoringEnabled
                 )
-                
-                // Network Bandwidth Card
-                HStack(spacing: 8) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "arrow.down.circle.fill")
-                            .font(.system(size: 13))
-                            .foregroundColor(Color.cyan)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("DOWNLOAD")
-                                .font(.system(size: 8.5, weight: .bold))
-                                .foregroundColor(.secondary)
-                            Text(formatBytes(sampler.metrics.netDownloadRate, perSec: true))
-                                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(8)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color(NSColor.controlBackgroundColor).opacity(0.65))
-                    )
-                    
-                    HStack(spacing: 6) {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 13))
-                            .foregroundColor(Color.indigo)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("UPLOAD")
-                                .font(.system(size: 8.5, weight: .bold))
-                                .foregroundColor(.secondary)
-                            Text(formatBytes(sampler.metrics.netUploadRate, perSec: true))
-                                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(8)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color(NSColor.controlBackgroundColor).opacity(0.65))
-                    )
-                }
-                
-                // Temperature / Thermal Status Card
-                HStack {
-                    HStack(spacing: 6) {
-                        Image(systemName: "thermometer.medium")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundColor(thermalColor)
-                        Text("THERMAL CONDITION")
-                            .font(.system(size: 9.5, weight: .bold))
+            }
+            .opacity(sampler.isMonitoringEnabled ? 1.0 : 0.45)
+            .grayscale(sampler.isMonitoringEnabled ? 0.0 : 0.9)
+            
+            Divider()
+            
+            // Network & Thermal Card Grid
+            HStack(spacing: 8) {
+                // Network Box
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "network")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.secondary)
+                        Text("NETWORK")
+                            .font(.system(size: 9, weight: .bold))
                             .foregroundColor(.secondary)
                     }
-                    Spacer()
+                    HStack {
+                        Image(systemName: "arrow.down")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundColor(sampler.isMonitoringEnabled ? Color(nsColor: .systemBlue) : .secondary)
+                        Text(formatBytes(sampler.metrics.netDownloadRate, perSec: true))
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    }
+                    HStack {
+                        Image(systemName: "arrow.up")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundColor(sampler.isMonitoringEnabled ? Color(nsColor: .systemPurple) : .secondary)
+                        Text(formatBytes(sampler.metrics.netUploadRate, perSec: true))
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 7).fill(Color(nsColor: .controlBackgroundColor)))
+                
+                // Thermal Box
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "thermometer.medium")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.secondary)
+                        Text("THERMAL")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundColor(.secondary)
+                    }
                     HStack(spacing: 5) {
                         Circle()
                             .fill(thermalColor)
                             .frame(width: 7, height: 7)
                         Text(thermalLabel)
-                            .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                            .font(.system(size: 10.5, weight: .semibold))
                             .foregroundColor(thermalColor)
                     }
+                    .padding(.top, 2)
+                    
+                    Text("Up \(sampler.metrics.uptimeString)")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundColor(.secondary)
                 }
-                .padding(9)
-                .background(
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(Color(NSColor.controlBackgroundColor).opacity(0.65))
-                )
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 7).fill(Color(nsColor: .controlBackgroundColor)))
             }
+            .opacity(sampler.isMonitoringEnabled ? 1.0 : 0.45)
+            .grayscale(sampler.isMonitoringEnabled ? 0.0 : 0.9)
             
             Divider()
-                .opacity(0.6)
             
-            // Bottom Action Footer
+            // Footer
             HStack {
                 Button(action: {
                     let task = Process()
@@ -548,11 +494,8 @@ struct MacDashPopoverView: View {
                     task.arguments = ["-a", "Activity Monitor"]
                     try? task.run()
                 }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "chart.bar.xaxis")
-                        Text("Activity Monitor")
-                    }
-                    .font(.system(size: 10.5, weight: .medium))
+                    Text("Activity Monitor…")
+                        .font(.system(size: 10.5, weight: .regular))
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(.secondary)
@@ -563,20 +506,19 @@ struct MacDashPopoverView: View {
                     NSApplication.shared.terminate(nil)
                 }) {
                     Text("Quit")
-                        .font(.system(size: 10.5, weight: .medium))
-                        .foregroundColor(.secondary)
+                        .font(.system(size: 10.5, weight: .regular))
                 }
                 .buttonStyle(.plain)
+                .foregroundColor(.secondary)
             }
-            .padding(.horizontal, 4)
-            .padding(.top, -2)
+            .padding(.horizontal, 2)
         }
-        .padding(14)
-        .frame(width: 290)
+        .padding(12)
+        .frame(width: 275)
     }
 }
 
-// MARK: - Application Delegate & Status Bar Controller
+// MARK: - Application Delegate
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
@@ -588,7 +530,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         
         let contentView = MacDashPopoverView(sampler: sampler)
-        popover.contentSize = NSSize(width: 290, height: 420)
+        popover.contentSize = NSSize(width: 275, height: 380)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: contentView)
         
@@ -605,23 +547,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func updateStatusBarButton() {
         guard let button = statusItem.button else { return }
+        
+        if !sampler.isMonitoringEnabled {
+            button.image = NSImage(systemSymbolName: "gauge.with.needle", accessibilityDescription: "MacDash Paused")
+            let attr = NSMutableAttributedString(string: " Off", attributes: [
+                .font: NSFont.systemFont(ofSize: 10.5, weight: .regular),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ])
+            button.attributedTitle = attr
+            return
+        }
+        
         let cpu = sampler.metrics.cpuUsage
         let ram = sampler.metrics.ramPercentage
         
-        // Compact, clean status bar typography: [Icon] C: 12% R: 64%
-        let title = String(format: " CPU %.0f%% · RAM %.0f%%", cpu, ram)
-        
-        let attr = NSMutableAttributedString()
-        if let icon = NSImage(systemSymbolName: "gauge.badge.bolt", accessibilityDescription: "MacDash") {
-            let config = NSImage.SymbolConfiguration(pointSize: 11, weight: .medium)
-            button.image = icon.withSymbolConfiguration(config)
-        }
-        
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .medium)
-        let textAttr: [NSAttributedString.Key: Any] = [
-            .font: font
-        ]
-        attr.append(NSAttributedString(string: title, attributes: textAttr))
+        button.image = NSImage(systemSymbolName: "gauge.with.needle.fill", accessibilityDescription: "MacDash")
+        let title = String(format: " %.0f%% · %.0f%%", cpu, ram)
+        let attr = NSMutableAttributedString(string: title, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .medium),
+            .foregroundColor: NSColor.labelColor
+        ])
         button.attributedTitle = attr
     }
     
