@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+current="$(pmset -g | awk '$1 == "SleepDisabled" { print $2; exit }')"
+requested="${1:-}"
+
+case "${requested}" in
+  "")
+    case "$current" in
+      0)
+        next=1
+        action_label="toggle to disable sleep"
+        next_label="disable sleep"
+        ;;
+      1)
+        next=0
+        action_label="toggle to enable sleep"
+        next_label="enable sleep"
+        ;;
+      *)
+        echo "Unable to read current SleepDisabled value from pmset." >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  0|1)
+    if [ "$requested" = "1" ]; then
+      next=0
+      action_label="force enable sleep"
+      next_label="enable sleep"
+    else
+      next=1
+      action_label="force disable sleep"
+      next_label="disable sleep"
+    fi
+    ;;
+  *)
+    echo "Usage: toggle-sleep [0|1]" >&2
+    echo "  0 = force disable sleep" >&2
+    echo "  1 = force enable sleep" >&2
+    exit 1
+    ;;
+esac
+
+case "$current" in
+  0) current_label="sleep is enabled" ;;
+  1) current_label="sleep is disabled" ;;
+  *) current_label="unknown" ;;
+esac
+
+echo "Current state: ${current_label} (SleepDisabled=${current})."
+echo "Next action: will ${action_label}."
+
+sudo pmset disablesleep "$next"
+echo "Done: ${next_label}."
