@@ -749,27 +749,31 @@ struct MacDashPopoverView: View {
     }
 
     var body: some View {
-        VStack(spacing: 10) {
-            headerView
-            temperatureHero
+        ScrollView(.vertical) {
+            VStack(spacing: 8) {
+                headerView
+                temperatureHero
 
-            Group {
-                if #available(macOS 26.0, *) {
-                    GlassEffectContainer(spacing: 8) { metricGrid }
-                } else {
-                    metricGrid
+                Group {
+                    if #available(macOS 26.0, *) {
+                        GlassEffectContainer(spacing: 8) { metricGrid }
+                    } else {
+                        metricGrid
+                    }
                 }
-            }
-            .opacity(sampler.isMonitoringEnabled ? 1 : 0.5)
-            .grayscale(sampler.isMonitoringEnabled ? 0 : 0.85)
+                .opacity(sampler.isMonitoringEnabled ? 1 : 0.5)
+                .grayscale(sampler.isMonitoringEnabled ? 0 : 0.85)
 
-            networkRow
-            statusRow
-            topAppsSection
-            footerView
+                networkRow
+                statusRow
+                topAppsSection
+                footerView
+            }
+            .padding(13)
+            .frame(width: 340)
         }
-        .padding(13)
-        .frame(width: 340)
+        .scrollIndicators(.hidden)
+        .frame(width: 340, height: 650)
     }
 
     private func forceQuit(_ item: AppMemoryUsage) {
@@ -795,7 +799,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         let contentView = MacDashPopoverView(sampler: sampler)
-        popover.contentSize = NSSize(width: 340, height: 605)
+        popover.contentSize = NSSize(width: 340, height: 650)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: contentView)
 
