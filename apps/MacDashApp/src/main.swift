@@ -268,6 +268,29 @@ func appleSemanticColor(for percent: Double) -> Color {
 
 // MARK: - Native Apple Aesthetic HUD Components
 
+struct GlassIcon: View {
+    let symbol: String
+    let tint: Color
+    var size: CGFloat = 22
+    var diameter: CGFloat = 50
+
+    var body: some View {
+        let glyph = Image(systemName: symbol)
+            .font(.system(size: size, weight: .semibold))
+            .symbolRenderingMode(.hierarchical)
+            .foregroundStyle(tint)
+            .frame(width: diameter, height: diameter)
+        Group {
+            if #available(macOS 26.0, *) {
+                glyph.glassEffect(.regular, in: Circle())
+            } else {
+                glyph.background(tint.opacity(0.15), in: Circle())
+            }
+        }
+        .accessibilityHidden(true)
+    }
+}
+
 struct GlassMetricTile: View {
     let title: String
     let value: String
@@ -277,17 +300,11 @@ struct GlassMetricTile: View {
     var progress: Double? = nil
     var secondaryValue: String? = nil
 
-    private var shape: RoundedRectangle { RoundedRectangle(cornerRadius: 26, style: .continuous) }
 
     var body: some View {
-        let content = VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top) {
-                Image(systemName: icon)
-                    .font(.system(size: 23, weight: .semibold))
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(tint)
-                    .frame(width: 52, height: 52)
-                    .background(tint.opacity(0.15), in: Circle())
+                GlassIcon(symbol: icon, tint: tint, size: 22, diameter: 50)
                 Spacer(minLength: 0)
                 if let progress {
                     ZStack {
@@ -323,18 +340,9 @@ struct GlassMetricTile: View {
                     .minimumScaleFactor(0.8)
             }
         }
-        .padding(17)
+        .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(height: 162, alignment: .topLeading)
-        .contentShape(shape)
-
-        Group {
-            if #available(macOS 26.0, *) {
-                content.glassEffect(.regular, in: shape)
-            } else {
-                content.background(.regularMaterial, in: shape)
-            }
-        }
+        .frame(height: 140, alignment: .topLeading)
         .accessibilityElement(children: .combine)
     }
 }
@@ -365,7 +373,7 @@ struct MacDashPopoverView: View {
     }
 
     private var metricGrid: some View {
-        LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
+        LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
             GlassMetricTile(
                 title: "CPU",
                 value: String(format: "%.0f%%", sampler.metrics.cpuUsage),
@@ -403,11 +411,7 @@ struct MacDashPopoverView: View {
     var body: some View {
         VStack(spacing: 15) {
             HStack(spacing: 10) {
-                Image(systemName: "gauge.with.needle.fill")
-                    .font(.system(size: 19, weight: .semibold))
-                    .foregroundStyle(Color(nsColor: .controlAccentColor))
-                    .frame(width: 42, height: 42)
-                    .background(Color(nsColor: .controlAccentColor).opacity(0.13), in: Circle())
+                GlassIcon(symbol: "gauge.with.needle.fill", tint: Color(nsColor: .controlAccentColor), size: 18, diameter: 42)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("MacDash")
                         .font(.system(size: 17, weight: .bold, design: .rounded))
@@ -436,11 +440,7 @@ struct MacDashPopoverView: View {
             .grayscale(sampler.isMonitoringEnabled ? 0 : 0.85)
 
             HStack(spacing: 9) {
-                Image(systemName: "thermometer.medium")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(thermalColor)
-                    .frame(width: 36, height: 36)
-                    .background(thermalColor.opacity(0.14), in: Circle())
+                GlassIcon(symbol: "thermometer.medium", tint: thermalColor, size: 17, diameter: 36)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Thermal")
                         .font(.system(size: 11, weight: .medium))
@@ -457,15 +457,8 @@ struct MacDashPopoverView: View {
                     .font(.system(size: 12, weight: .medium, design: .rounded).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background {
-                if #available(macOS 26.0, *) {
-                    Capsule().fill(.clear).glassEffect(.regular, in: Capsule())
-                } else {
-                    Capsule().fill(.regularMaterial)
-                }
-            }
+            .padding(.horizontal, 4)
+            .padding(.vertical, 2)
             .opacity(sampler.isMonitoringEnabled ? 1 : 0.5)
 
             VStack(alignment: .leading, spacing: 9) {
@@ -483,8 +476,8 @@ struct MacDashPopoverView: View {
                         Image(nsImage: item.icon)
                             .resizable()
                             .aspectRatio(contentMode: .fit)
-                            .frame(width: 30, height: 30)
-                            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                            .frame(width: 26, height: 26)
+                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                         VStack(alignment: .leading, spacing: 2) {
                             Text(item.name)
                                 .font(.system(size: 13, weight: .medium))
@@ -514,7 +507,7 @@ struct MacDashPopoverView: View {
                             .accessibilityLabel("Force Quit \(item.name)")
                         }
                     }
-                    .padding(.vertical, 3)
+                    .padding(.vertical, 1)
                     if item.id != sampler.metrics.topApps.prefix(6).last?.id {
                         Divider().padding(.leading, 40)
                     }
@@ -551,8 +544,8 @@ struct MacDashPopoverView: View {
             .font(.system(size: 12, weight: .medium))
             .padding(.top, 2)
         }
-        .padding(18)
-        .frame(width: 440)
+        .padding(16)
+        .frame(width: 410)
     }
 
     private func forceQuit(_ item: AppMemoryUsage) {
@@ -578,7 +571,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         
         let contentView = MacDashPopoverView(sampler: sampler)
-        popover.contentSize = NSSize(width: 440, height: 800)
+        popover.contentSize = NSSize(width: 410, height: 700)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: contentView)
         
