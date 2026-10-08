@@ -279,20 +279,20 @@ struct AppleMetricRow: View {
     }
     
     var body: some View {
-        VStack(spacing: 5) {
+        VStack(spacing: 7) {
             HStack(alignment: .firstTextBaseline) {
-                HStack(spacing: 5) {
+                HStack(spacing: 6) {
                     Image(systemName: icon)
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(tintColor)
-                        .frame(width: 14)
+                        .frame(width: 17)
                     Text(title)
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(isDisabled ? .secondary.opacity(0.6) : .secondary)
                 }
                 Spacer()
                 Text(value)
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .font(.system(size: 14, weight: .semibold, design: .monospaced))
                     .foregroundColor(isDisabled ? .secondary.opacity(0.6) : .primary)
             }
             
@@ -301,18 +301,18 @@ struct AppleMetricRow: View {
                 ZStack(alignment: .leading) {
                     Capsule()
                         .fill(Color(nsColor: .separatorColor).opacity(0.35))
-                        .frame(height: 4.5)
+                        .frame(height: 5.5)
                     
                     Capsule()
                         .fill(tintColor)
-                        .frame(width: max(0, min(geo.size.width, geo.size.width * CGFloat(percent / 100.0))), height: 4.5)
+                        .frame(width: max(0, min(geo.size.width, geo.size.width * CGFloat(percent / 100.0))), height: 5.5)
                 }
             }
-            .frame(height: 4.5)
+            .frame(height: 5.5)
             
             HStack {
                 Text(detail)
-                    .font(.system(size: 9.5, weight: .regular, design: .monospaced))
+                    .font(.system(size: 11, weight: .regular))
                     .foregroundColor(.secondary)
                 Spacer()
             }
@@ -347,15 +347,15 @@ struct MacDashPopoverView: View {
     }
 
     var body: some View {
-        VStack(spacing: 11) {
+        VStack(spacing: 13) {
             // Header: Apple Control Center style
             HStack {
                 HStack(spacing: 6) {
                     Image(systemName: "gauge.with.needle.fill")
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.system(size: 15, weight: .semibold))
                         .foregroundColor(sampler.isMonitoringEnabled ? Color(nsColor: .controlAccentColor) : .secondary)
                     Text("MacDash")
-                        .font(.system(size: 13, weight: .bold))
+                        .font(.system(size: 15, weight: .bold))
                 }
                 
                 Spacer()
@@ -371,7 +371,7 @@ struct MacDashPopoverView: View {
             Divider()
             
             // Telemetry Sections
-            VStack(spacing: 10) {
+            VStack(spacing: 13) {
                 AppleMetricRow(
                     title: "CPU",
                     value: String(format: "%.1f%%", sampler.metrics.cpuUsage),
@@ -408,24 +408,24 @@ struct MacDashPopoverView: View {
             VStack(alignment: .leading, spacing: 7) {
                 HStack {
                     Label("Apps by Memory", systemImage: "memorychip")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: 13, weight: .semibold))
                     Spacer()
                     Text("PHYS. FOOTPRINT")
-                        .font(.system(size: 8, weight: .medium))
+                        .font(.system(size: 10, weight: .medium))
                         .foregroundColor(.secondary)
                 }
                 ForEach(sampler.metrics.topApps.prefix(6)) { item in
                     HStack(spacing: 7) {
                         Image(systemName: "app.fill")
-                            .font(.system(size: 11))
+                            .font(.system(size: 13))
                             .foregroundColor(.secondary)
-                            .frame(width: 15)
+                            .frame(width: 17)
                         Text(item.name)
-                            .font(.system(size: 10.5))
+                            .font(.system(size: 12))
                             .lineLimit(1)
                         Spacer(minLength: 4)
                         Text(formatBytes(item.memoryBytes))
-                            .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
                             .foregroundColor(.secondary)
                         Button(appToForceQuit?.pid == item.pid ? "Confirm" : "Force Quit", role: .destructive) {
                             if appToForceQuit?.pid == item.pid {
@@ -440,25 +440,25 @@ struct MacDashPopoverView: View {
                                 appToForceQuit = item
                             }
                         }
-                        .font(.system(size: 9, weight: .medium))
+                        .font(.system(size: 10.5, weight: .medium))
                         .buttonStyle(.bordered)
                         .controlSize(.mini)
                         .tint(.red)
                         if appToForceQuit?.pid == item.pid {
                             Button("Cancel") { appToForceQuit = nil }
-                                .font(.system(size: 9))
+                                .font(.system(size: 10.5))
                                 .buttonStyle(.plain)
                         }
                     }
                 }
                 if sampler.metrics.topApps.isEmpty {
                     Text("No app memory data available")
-                        .font(.system(size: 10))
+                        .font(.system(size: 11.5))
                         .foregroundColor(.secondary)
                 }
                 if appToForceQuit != nil {
                     Text("Unsaved changes may be lost.")
-                        .font(.system(size: 9))
+                        .font(.system(size: 10.5))
                         .foregroundColor(.red)
                 }
             }
@@ -472,25 +472,25 @@ struct MacDashPopoverView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 4) {
                         Image(systemName: "network")
-                            .font(.system(size: 10, weight: .medium))
+                            .font(.system(size: 11, weight: .medium))
                             .foregroundColor(.secondary)
                         Text("NETWORK")
-                            .font(.system(size: 9, weight: .bold))
+                            .font(.system(size: 10, weight: .bold))
                             .foregroundColor(.secondary)
                     }
                     HStack {
                         Image(systemName: "arrow.down")
-                            .font(.system(size: 9, weight: .bold))
+                            .font(.system(size: 11, weight: .bold))
                             .foregroundColor(sampler.isMonitoringEnabled ? Color(nsColor: .systemBlue) : .secondary)
                         Text(formatBytes(sampler.metrics.netDownloadRate, perSec: true))
-                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
                     }
                     HStack {
                         Image(systemName: "arrow.up")
-                            .font(.system(size: 9, weight: .bold))
+                            .font(.system(size: 11, weight: .bold))
                             .foregroundColor(sampler.isMonitoringEnabled ? Color(nsColor: .systemPurple) : .secondary)
                         Text(formatBytes(sampler.metrics.netUploadRate, perSec: true))
-                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -501,10 +501,10 @@ struct MacDashPopoverView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 4) {
                         Image(systemName: "thermometer.medium")
-                            .font(.system(size: 10, weight: .medium))
+                            .font(.system(size: 11, weight: .medium))
                             .foregroundColor(.secondary)
                         Text("THERMAL")
-                            .font(.system(size: 9, weight: .bold))
+                            .font(.system(size: 10, weight: .bold))
                             .foregroundColor(.secondary)
                     }
                     HStack(spacing: 5) {
@@ -512,13 +512,13 @@ struct MacDashPopoverView: View {
                             .fill(thermalColor)
                             .frame(width: 7, height: 7)
                         Text(thermalLabel)
-                            .font(.system(size: 10.5, weight: .semibold))
+                            .font(.system(size: 12, weight: .semibold))
                             .foregroundColor(thermalColor)
                     }
                     .padding(.top, 2)
                     
                     Text("Up \(sampler.metrics.uptimeString)")
-                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .font(.system(size: 10.5, weight: .medium))
                         .foregroundColor(.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -539,7 +539,7 @@ struct MacDashPopoverView: View {
                     try? task.run()
                 }) {
                     Text("Activity Monitor…")
-                        .font(.system(size: 10.5, weight: .regular))
+                        .font(.system(size: 12, weight: .regular))
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(.secondary)
@@ -550,15 +550,15 @@ struct MacDashPopoverView: View {
                     NSApplication.shared.terminate(nil)
                 }) {
                     Text("Quit")
-                        .font(.system(size: 10.5, weight: .regular))
+                        .font(.system(size: 12, weight: .regular))
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(.secondary)
             }
             .padding(.horizontal, 2)
         }
-        .padding(14)
-        .frame(width: 370)
+        .padding(16)
+        .frame(width: 400)
     }
 }
 
@@ -574,7 +574,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         
         let contentView = MacDashPopoverView(sampler: sampler)
-        popover.contentSize = NSSize(width: 370, height: 600)
+        popover.contentSize = NSSize(width: 400, height: 660)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: contentView)
         
