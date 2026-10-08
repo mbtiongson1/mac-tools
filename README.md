@@ -39,8 +39,9 @@ A native macOS status bar monitor (`~/Applications/MacDash.app`) built with Swif
 - **Popover card**: A compact, two-column glanceable dashboard with large metrics and native Liquid Glass applied to icon glyphs only on macOS 26+ (with a tinted icon fallback on older macOS):
   - **CPU**: Real-time system CPU percentage & load averages, with a color-coded activity ring.
   - **RAM**: Memory utilization (active, wired, compressor vs total physical RAM), plus app icons and top apps sorted by physical memory footprint.
-  - **SWAP**: Absolute swap used and available capacity; avoids presenting allocated swap capacity as a misleading pressure percentage.
-  - **Network**: Real-time download & upload bandwidth rates sampled from active non-loopback interfaces.
+  - **Storage**: Real root volume capacity, available/free space, and utilization percentage with semantic health ring.
+  - **SWAP**: Absolute swap used with explicit macOS-managed dynamic virtual memory indication; avoids misleading capacity caps or pressure percentages.
+  - **Network**: Real-time download & upload bandwidth rates sampled from active non-loopback interfaces in a compact Control Center-style row.
   - **Thermal Condition**: Apple Silicon thermal state and uptime in a compact status capsule.
   - **Uptime**: System uptime clock.
   - **Quick Actions**: Force-quit an app after inline confirmation, or open Activity Monitor.

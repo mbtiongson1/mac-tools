@@ -22,63 +22,72 @@ struct SystemMetrics {
     var ramUsedBytes: Double = 0.0
     var ramTotalBytes: Double = Double(ProcessInfo.processInfo.physicalMemory)
     var swapUsedBytes: Double = 0.0
-    var swapTotalBytes: Double = 0.0
+    var diskUsedBytes: Double = 0.0
+    var diskTotalBytes: Double = 0.0
+    var diskFreeBytes: Double = 0.0
     var topApps: [AppMemoryUsage] = []
     var netDownloadRate: Double = 0.0   // bytes / sec
     var netUploadRate: Double = 0.0     // bytes / sec
     var thermalState: ProcessInfo.ThermalState = .nominal
     var loadAverages: (Double, Double, Double) = (0.0, 0.0, 0.0)
     var uptimeString: String = ""
-    
+
     var ramPercentage: Double {
         guard ramTotalBytes > 0 else { return 0 }
         return (ramUsedBytes / ramTotalBytes) * 100.0
     }
-    
+
+    var diskPercentage: Double {
+        guard diskTotalBytes > 0 else { return 0 }
+        return min(100.0, max(0.0, (diskUsedBytes / diskTotalBytes) * 100.0))
+    }
 }
 
 class MetricsSampler: ObservableObject {
     @Published var metrics = SystemMetrics()
     @Published var isMonitoringEnabled: Bool = true
-    
+
     private var lastCpuLoad: host_cpu_load_info?
     private var lastNetRx: Double?
     private var lastNetTx: Double?
     private var lastNetTime: Date?
     private var timer: Timer?
-    
+
     init() {
         sample()
         start()
     }
-    
+
     func start() {
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             guard let self = self, self.isMonitoringEnabled else { return }
             self.sample()
         }
     }
-    
+
     func sample() {
         // NSWorkspace is AppKit state; snapshot its app list on the main thread.
         let runningApps = NSWorkspace.shared.runningApplications
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-            
+
             let cpu = self.sampleCPU()
             let (ramUsed, load) = self.sampleRAMAndLoad()
-            let (swapUsed, swapTotal) = self.sampleSwapUsage()
+            let swapUsed = self.sampleSwapUsage()
+            let (diskUsed, diskTotal, diskFree) = self.sampleDiskSpace()
             let apps = self.sampleTopApps(from: runningApps)
             let (rxRate, txRate) = self.sampleNetwork()
             let thermal = ProcessInfo.processInfo.thermalState
             let uptime = self.sampleUptime()
-            
+
             DispatchQueue.main.async {
                 self.metrics.cpuUsage = cpu
                 self.metrics.ramUsedBytes = ramUsed
                 self.metrics.loadAverages = load
                 self.metrics.swapUsedBytes = swapUsed
-                self.metrics.swapTotalBytes = swapTotal
+                self.metrics.diskUsedBytes = diskUsed
+                self.metrics.diskTotalBytes = diskTotal
+                self.metrics.diskFreeBytes = diskFree
                 self.metrics.topApps = apps
                 self.metrics.netDownloadRate = rxRate
                 self.metrics.netUploadRate = txRate
@@ -87,7 +96,7 @@ class MetricsSampler: ObservableObject {
             }
         }
     }
-    
+
     private func sampleCPU() -> Double {
         var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size)
         var curLoad = host_cpu_load_info()
@@ -97,14 +106,14 @@ class MetricsSampler: ObservableObject {
             }
         }
         guard result == KERN_SUCCESS else { return 0.0 }
-        
+
         guard let prev = lastCpuLoad else {
             lastCpuLoad = curLoad
             return 0.0
         }
-        
+
         lastCpuLoad = curLoad
-        
+
         let u = Double(curLoad.cpu_ticks.0 - prev.cpu_ticks.0)
         let s = Double(curLoad.cpu_ticks.1 - prev.cpu_ticks.1)
         let i = Double(curLoad.cpu_ticks.2 - prev.cpu_ticks.2)
@@ -115,7 +124,7 @@ class MetricsSampler: ObservableObject {
         }
         return 0.0
     }
-    
+
     private func sampleRAMAndLoad() -> (Double, (Double, Double, Double)) {
         var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
         var vmStat = vm_statistics64()
@@ -124,7 +133,7 @@ class MetricsSampler: ObservableObject {
                 host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
             }
         }
-        
+
         var ramUsed: Double = 0.0
         if ret == KERN_SUCCESS {
             let pageSize = Double(vm_kernel_page_size)
@@ -133,24 +142,36 @@ class MetricsSampler: ObservableObject {
             let compressed = Double(vmStat.compressor_page_count) * pageSize
             ramUsed = active + wired + compressed
         }
-        
+
         var loadavg = [Double](repeating: 0.0, count: 3)
         getloadavg(&loadavg, 3)
         let loads = (loadavg[0], loadavg[1], loadavg[2])
-        
+
         return (ramUsed, loads)
     }
-    
-    private func sampleSwapUsage() -> (Double, Double) {
+
+    private func sampleSwapUsage() -> Double {
         var mib: [Int32] = [CTL_VM, VM_SWAPUSAGE]
         var swap = xsw_usage()
         var size = MemoryLayout<xsw_usage>.size
         if sysctl(&mib, 2, &swap, &size, nil, 0) == 0 {
-            return (Double(swap.xsu_used), Double(swap.xsu_total))
+            return Double(swap.xsu_used)
         }
-        return (0.0, 0.0)
+        return 0.0
     }
-    
+
+    private func sampleDiskSpace() -> (Double, Double, Double) {
+        var stat = statfs()
+        if statfs("/", &stat) == 0 {
+            let bsize = Double(stat.f_bsize)
+            let total = Double(stat.f_blocks) * bsize
+            let free = Double(stat.f_bavail) * bsize
+            let used = max(0, total - free)
+            return (used, total, free)
+        }
+        return (0.0, 0.0, 0.0)
+    }
+
     private func sampleTopApps(from runningApps: [NSRunningApplication]) -> [AppMemoryUsage] {
         runningApps
             .filter { $0.activationPolicy == .regular && $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
@@ -173,7 +194,7 @@ class MetricsSampler: ObservableObject {
             .prefix(8)
             .map { $0 }
     }
-    
+
     private func sampleNetwork() -> (Double, Double) {
         var addresses: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&addresses) == 0, let first = addresses else { return (0, 0) }
@@ -194,11 +215,11 @@ class MetricsSampler: ObservableObject {
             }
             cursor = interface.ifa_next
         }
-        
+
         let now = Date()
         var rxRate: Double = 0
         var txRate: Double = 0
-        
+
         if let lastRx = lastNetRx, let lastTx = lastNetTx, let lastTime = lastNetTime {
             let dt = now.timeIntervalSince(lastTime)
             if dt > 0 {
@@ -209,14 +230,14 @@ class MetricsSampler: ObservableObject {
                 txRate = max(0, txDelta / dt)
             }
         }
-        
+
         lastNetRx = rxTotal
         lastNetTx = txTotal
         lastNetTime = now
-        
+
         return (rxRate, txRate)
     }
-    
+
     private func sampleUptime() -> String {
         var bootTime = timeval()
         var size = MemoryLayout<timeval>.size
@@ -253,6 +274,16 @@ func formatBytes(_ bytes: Double, perSec: Bool = false) -> String {
     }
 }
 
+func formatDiskBytes(_ bytes: Double) -> String {
+    let formatter = ByteCountFormatter()
+    formatter.countStyle = .file
+    formatter.allowedUnits = [.useGB, .useTB, .useMB]
+    formatter.includesUnit = true
+    formatter.isAdaptive = true
+    formatter.allowsNonnumericFormatting = false
+    return formatter.string(fromByteCount: Int64(max(0, bytes)))
+}
+
 func appleSemanticColor(for percent: Double) -> Color {
     switch percent {
     case ..<50:
@@ -271,8 +302,8 @@ func appleSemanticColor(for percent: Double) -> Color {
 struct GlassIcon: View {
     let symbol: String
     let tint: Color
-    var size: CGFloat = 22
-    var diameter: CGFloat = 50
+    var size: CGFloat = 15
+    var diameter: CGFloat = 32
 
     var body: some View {
         let glyph = Image(systemName: symbol)
@@ -300,49 +331,50 @@ struct GlassMetricTile: View {
     var progress: Double? = nil
     var secondaryValue: String? = nil
 
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top) {
-                GlassIcon(symbol: icon, tint: tint, size: 22, diameter: 50)
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .center) {
+                GlassIcon(symbol: icon, tint: tint, size: 15, diameter: 32)
                 Spacer(minLength: 0)
                 if let progress {
                     ZStack {
-                        Circle().stroke(tint.opacity(0.16), lineWidth: 5)
-                        Circle().trim(from: 0, to: CGFloat(min(max(progress, 0), 100) / 100))
-                            .stroke(tint, style: StrokeStyle(lineWidth: 5, lineCap: .round))
+                        Circle()
+                            .stroke(tint.opacity(0.18), lineWidth: 3.2)
+                        Circle()
+                            .trim(from: 0, to: CGFloat(min(max(progress, 0), 100) / 100))
+                            .stroke(tint, style: StrokeStyle(lineWidth: 3.2, lineCap: .round))
                             .rotationEffect(.degrees(-90))
                     }
-                    .frame(width: 31, height: 31)
-                    .padding(4)
+                    .frame(width: 22, height: 22)
+                    .padding(2)
                 }
             }
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(title.uppercased())
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .font(.system(size: 9.5, weight: .bold, design: .rounded))
                     .tracking(0.7)
                     .foregroundStyle(.secondary)
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
                     Text(value)
-                        .font(.system(size: 27, weight: .bold, design: .rounded).monospacedDigit())
+                        .font(.system(size: 20, weight: .bold, design: .rounded).monospacedDigit())
                         .minimumScaleFactor(0.75)
                         .lineLimit(1)
                     if let secondaryValue {
                         Text(secondaryValue)
-                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
                             .foregroundStyle(.secondary)
                     }
                 }
                 Text(detail)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 10.5, weight: .medium))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
             }
         }
-        .padding(14)
+        .padding(9)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(height: 140, alignment: .topLeading)
+        .frame(height: 94, alignment: .topLeading)
         .accessibilityElement(children: .combine)
     }
 }
@@ -350,7 +382,7 @@ struct GlassMetricTile: View {
 struct MacDashPopoverView: View {
     @ObservedObject var sampler: MetricsSampler
     @State private var appToForceQuit: AppMemoryUsage?
-    
+
     var thermalColor: Color {
         guard sampler.isMonitoringEnabled else { return Color.secondary.opacity(0.4) }
         switch sampler.metrics.thermalState {
@@ -361,7 +393,7 @@ struct MacDashPopoverView: View {
         @unknown default: return Color(nsColor: .systemGreen)
         }
     }
-    
+
     var thermalLabel: String {
         switch sampler.metrics.thermalState {
         case .nominal: return "Nominal"
@@ -372,8 +404,29 @@ struct MacDashPopoverView: View {
         }
     }
 
+    private var headerView: some View {
+        HStack(spacing: 9) {
+            GlassIcon(symbol: "gauge.with.needle.fill", tint: Color(nsColor: .controlAccentColor), size: 15, diameter: 32)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("MacDash")
+                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                Text("SYSTEM OVERVIEW")
+                    .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                    .tracking(0.8)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Toggle("Monitoring", isOn: $sampler.isMonitoringEnabled)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .labelsHidden()
+                .help(sampler.isMonitoringEnabled ? "Pause monitoring" : "Resume monitoring")
+        }
+        .padding(.horizontal, 2)
+    }
+
     private var metricGrid: some View {
-        LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
+        LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 8) {
             GlassMetricTile(
                 title: "CPU",
                 value: String(format: "%.0f%%", sampler.metrics.cpuUsage),
@@ -391,47 +444,200 @@ struct MacDashPopoverView: View {
                 progress: sampler.metrics.ramPercentage
             )
             GlassMetricTile(
-                title: "Swap Used",
-                value: formatBytes(sampler.metrics.swapUsedBytes),
-                detail: "of \(formatBytes(sampler.metrics.swapTotalBytes)) available",
-                icon: "arrow.triangle.2.circlepath",
-                tint: Color(nsColor: .systemOrange),
-                progress: sampler.metrics.swapTotalBytes > 0 ? sampler.metrics.swapUsedBytes / sampler.metrics.swapTotalBytes * 100 : 0
+                title: "Storage",
+                value: String(format: "%.0f%%", sampler.metrics.diskPercentage),
+                detail: "\(formatDiskBytes(sampler.metrics.diskFreeBytes)) free of \(formatDiskBytes(sampler.metrics.diskTotalBytes))",
+                icon: "internaldrive.fill",
+                tint: appleSemanticColor(for: sampler.metrics.diskPercentage),
+                progress: sampler.metrics.diskPercentage
             )
             GlassMetricTile(
-                title: "Download",
-                value: formatBytes(sampler.metrics.netDownloadRate, perSec: true),
-                detail: "↑  \(formatBytes(sampler.metrics.netUploadRate, perSec: true)) uploaded",
-                icon: "arrow.down.circle.fill",
-                tint: Color(nsColor: .systemTeal)
+                title: "Swap Used",
+                value: formatBytes(sampler.metrics.swapUsedBytes),
+                detail: "macOS-managed dynamic",
+                icon: "arrow.triangle.2.circlepath",
+                tint: Color(nsColor: .systemOrange)
             )
         }
     }
 
-    var body: some View {
-        VStack(spacing: 15) {
-            HStack(spacing: 10) {
-                GlassIcon(symbol: "gauge.with.needle.fill", tint: Color(nsColor: .controlAccentColor), size: 18, diameter: 42)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("MacDash")
-                        .font(.system(size: 17, weight: .bold, design: .rounded))
-                    Text("SYSTEM OVERVIEW")
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .tracking(0.8)
+    private var networkRow: some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 8) {
+                GlassIcon(symbol: "arrow.down.circle.fill", tint: Color(nsColor: .systemTeal), size: 14, diameter: 28)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("DOWNLOAD")
+                        .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                        .tracking(0.6)
                         .foregroundStyle(.secondary)
+                    Text(formatBytes(sampler.metrics.netDownloadRate, perSec: true))
+                        .font(.system(size: 12.5, weight: .bold, design: .rounded).monospacedDigit())
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
                 }
-                Spacer()
-                Toggle("Monitoring", isOn: $sampler.isMonitoringEnabled)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .labelsHidden()
-                    .help(sampler.isMonitoringEnabled ? "Pause monitoring" : "Resume monitoring")
             }
-            .padding(.horizontal, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Divider()
+                .frame(height: 22)
+                .opacity(0.4)
+
+            HStack(spacing: 8) {
+                GlassIcon(symbol: "arrow.up.circle.fill", tint: Color(nsColor: .systemIndigo), size: 14, diameter: 28)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("UPLOAD")
+                        .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                        .tracking(0.6)
+                        .foregroundStyle(.secondary)
+                    Text(formatBytes(sampler.metrics.netUploadRate, perSec: true))
+                        .font(.system(size: 12.5, weight: .bold, design: .rounded).monospacedDigit())
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 4)
+        .padding(.vertical, 2)
+        .opacity(sampler.isMonitoringEnabled ? 1 : 0.5)
+        .grayscale(sampler.isMonitoringEnabled ? 0 : 0.85)
+    }
+
+    private var statusRow: some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 8) {
+                GlassIcon(symbol: "thermometer.medium", tint: thermalColor, size: 14, diameter: 28)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("THERMAL")
+                        .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                        .tracking(0.6)
+                        .foregroundStyle(.secondary)
+                    Text(thermalLabel)
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(thermalColor)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Divider()
+                .frame(height: 22)
+                .opacity(0.4)
+
+            HStack(spacing: 8) {
+                GlassIcon(symbol: "clock.fill", tint: Color(nsColor: .secondaryLabelColor), size: 13, diameter: 28)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("UPTIME")
+                        .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                        .tracking(0.6)
+                        .foregroundStyle(.secondary)
+                    Text(sampler.metrics.uptimeString)
+                        .font(.system(size: 12, weight: .semibold, design: .rounded).monospacedDigit())
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 4)
+        .padding(.vertical, 2)
+        .opacity(sampler.isMonitoringEnabled ? 1 : 0.5)
+        .grayscale(sampler.isMonitoringEnabled ? 0 : 0.85)
+    }
+
+    private var topAppsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                Label("Apps Using Memory", systemImage: "square.stack.3d.up.fill")
+                    .font(.system(size: 12.5, weight: .semibold, design: .rounded))
+                Spacer()
+                Text("TOP 5")
+                    .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                    .tracking(0.6)
+                    .foregroundStyle(.tertiary)
+            }
+            ForEach(sampler.metrics.topApps.prefix(5)) { item in
+                HStack(spacing: 8) {
+                    Image(nsImage: item.icon)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 20, height: 20)
+                        .clipShape(RoundedRectangle(cornerRadius: 4.5, style: .continuous))
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(item.name)
+                            .font(.system(size: 11.5, weight: .medium))
+                            .lineLimit(1)
+                        Text(formatBytes(item.memoryBytes))
+                            .font(.system(size: 10, weight: .medium, design: .rounded).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 4)
+                    if appToForceQuit?.pid == item.pid {
+                        Button("Confirm") { forceQuit(item) }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.red)
+                            .controlSize(.mini)
+                        Button("Cancel") { appToForceQuit = nil }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Button { appToForceQuit = item } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 13))
+                                .foregroundStyle(.secondary.opacity(0.55))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Force quit \(item.name)")
+                        .accessibilityLabel("Force Quit \(item.name)")
+                    }
+                }
+                .padding(.vertical, 0.5)
+                if item.id != sampler.metrics.topApps.prefix(5).last?.id {
+                    Divider().opacity(0.3).padding(.leading, 28)
+                }
+            }
+            if sampler.metrics.topApps.isEmpty {
+                Text("No app memory data available")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 4)
+            }
+            if appToForceQuit != nil {
+                Label("Unsaved changes may be lost.", systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(.red)
+            }
+        }
+    }
+
+    private var footerView: some View {
+        HStack {
+            Button {
+                let task = Process()
+                task.launchPath = "/usr/bin/open"
+                task.arguments = ["-a", "Activity Monitor"]
+                try? task.run()
+            } label: {
+                Label("Activity Monitor", systemImage: "waveform.path.ecg")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            Spacer()
+            Button("Quit") { NSApplication.shared.terminate(nil) }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+        }
+        .font(.system(size: 11.5, weight: .medium))
+        .padding(.top, 2)
+    }
+
+    var body: some View {
+        VStack(spacing: 10) {
+            headerView
 
             Group {
                 if #available(macOS 26.0, *) {
-                    GlassEffectContainer(spacing: 12) { metricGrid }
+                    GlassEffectContainer(spacing: 8) { metricGrid }
                 } else {
                     metricGrid
                 }
@@ -439,113 +645,13 @@ struct MacDashPopoverView: View {
             .opacity(sampler.isMonitoringEnabled ? 1 : 0.5)
             .grayscale(sampler.isMonitoringEnabled ? 0 : 0.85)
 
-            HStack(spacing: 9) {
-                GlassIcon(symbol: "thermometer.medium", tint: thermalColor, size: 17, diameter: 36)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Thermal")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.secondary)
-                    Text(thermalLabel)
-                        .font(.system(size: 14, weight: .semibold, design: .rounded))
-                        .foregroundStyle(thermalColor)
-                }
-                Spacer()
-                Image(systemName: "clock")
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(.secondary)
-                Text("Up \(sampler.metrics.uptimeString)")
-                    .font(.system(size: 12, weight: .medium, design: .rounded).monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 4)
-            .padding(.vertical, 2)
-            .opacity(sampler.isMonitoringEnabled ? 1 : 0.5)
-
-            VStack(alignment: .leading, spacing: 9) {
-                HStack(alignment: .firstTextBaseline) {
-                    Label("Apps Using Memory", systemImage: "square.stack.3d.up.fill")
-                        .font(.system(size: 15, weight: .semibold, design: .rounded))
-                    Spacer()
-                    Text("TOP 6")
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .tracking(0.6)
-                        .foregroundStyle(.tertiary)
-                }
-                ForEach(sampler.metrics.topApps.prefix(6)) { item in
-                    HStack(spacing: 10) {
-                        Image(nsImage: item.icon)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .frame(width: 26, height: 26)
-                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(item.name)
-                                .font(.system(size: 13, weight: .medium))
-                                .lineLimit(1)
-                            Text(formatBytes(item.memoryBytes))
-                                .font(.system(size: 11, weight: .medium, design: .rounded).monospacedDigit())
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer(minLength: 4)
-                        if appToForceQuit?.pid == item.pid {
-                            Button("Confirm") { forceQuit(item) }
-                                .buttonStyle(.borderedProminent)
-                                .tint(.red)
-                                .controlSize(.small)
-                            Button("Cancel") { appToForceQuit = nil }
-                                .buttonStyle(.plain)
-                                .foregroundStyle(.secondary)
-                        } else {
-                            Button { appToForceQuit = item } label: {
-                                Label("Force Quit", systemImage: "xmark.circle.fill")
-                                    .labelStyle(.iconOnly)
-                                    .font(.system(size: 17))
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(.red.opacity(0.8))
-                            .help("Force quit \(item.name)")
-                            .accessibilityLabel("Force Quit \(item.name)")
-                        }
-                    }
-                    .padding(.vertical, 1)
-                    if item.id != sampler.metrics.topApps.prefix(6).last?.id {
-                        Divider().padding(.leading, 40)
-                    }
-                }
-                if sampler.metrics.topApps.isEmpty {
-                    Text("No app memory data available")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .padding(.vertical, 6)
-                }
-                if appToForceQuit != nil {
-                    Label("Unsaved changes may be lost.", systemImage: "exclamationmark.triangle.fill")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.red)
-                }
-            }
-
-            HStack {
-                Button {
-                    let task = Process()
-                    task.launchPath = "/usr/bin/open"
-                    task.arguments = ["-a", "Activity Monitor"]
-                    try? task.run()
-                } label: {
-                    Label("Activity Monitor", systemImage: "waveform.path.ecg")
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                Spacer()
-                Button("Quit") { NSApplication.shared.terminate(nil) }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-            }
-            .font(.system(size: 12, weight: .medium))
-            .padding(.top, 2)
+            networkRow
+            statusRow
+            topAppsSection
+            footerView
         }
-        .padding(16)
-        .frame(width: 410)
+        .padding(13)
+        .frame(width: 340)
     }
 
     private func forceQuit(_ item: AppMemoryUsage) {
@@ -566,29 +672,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var popover = NSPopover()
     let sampler = MetricsSampler()
     var displayTimer: Timer?
-    
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        
+
         let contentView = MacDashPopoverView(sampler: sampler)
-        popover.contentSize = NSSize(width: 410, height: 700)
+        popover.contentSize = NSSize(width: 340, height: 605)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: contentView)
-        
+
         if let button = statusItem.button {
             button.action = #selector(togglePopover)
             button.target = self
             updateStatusBarButton()
         }
-        
+
         displayTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.updateStatusBarButton()
         }
     }
-    
+
     func updateStatusBarButton() {
         guard let button = statusItem.button else { return }
-        
+
         if !sampler.isMonitoringEnabled {
             button.image = NSImage(systemSymbolName: "gauge.with.needle", accessibilityDescription: "MacDash Paused")
             let attr = NSMutableAttributedString(string: " Off", attributes: [
@@ -598,10 +704,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.attributedTitle = attr
             return
         }
-        
+
         let cpu = sampler.metrics.cpuUsage
         let ram = sampler.metrics.ramPercentage
-        
+
         button.image = NSImage(systemSymbolName: "gauge.with.needle.fill", accessibilityDescription: "MacDash")
         let title = String(format: " %.0f%% · %.0f%%", cpu, ram)
         let attr = NSMutableAttributedString(string: title, attributes: [
@@ -610,7 +716,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ])
         button.attributedTitle = attr
     }
-    
+
     @objc func togglePopover() {
         guard let button = statusItem.button else { return }
         if popover.isShown {
