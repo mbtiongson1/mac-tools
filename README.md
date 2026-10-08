@@ -35,9 +35,9 @@ mac-tools/
 
 ### MacDash (Menu Bar App)
 A native macOS status bar monitor (`~/Applications/MacDash.app`) built with SwiftUI:
-- **Menu bar item**: Live text displaying `CPU % · RAM %` alongside SF Symbol `gauge.badge.bolt`.
+- **Menu bar item**: CPU temperature in Celsius as the primary readout, followed by current swap used (for example, `76°C · 3.1 GB`) alongside a thermometer symbol.
 - **Popover card**: A compact, two-column glanceable dashboard with large metrics and native Liquid Glass applied to icon glyphs only on macOS 26+ (with a tinted icon fallback on older macOS):
-  - **CPU**: Real-time system CPU percentage & load averages, with a color-coded activity ring.
+  - **CPU**: CPU temperature in Celsius prominently displayed (sampled via `macmon`), plus real-time CPU utilization and load averages with a color-coded activity ring.
   - **RAM**: Memory utilization (active, wired, compressor vs total physical RAM), plus app icons and top apps sorted by physical memory footprint.
   - **Storage**: Real root volume capacity, available/free space, and utilization percentage with semantic health ring.
   - **SWAP**: Absolute swap used with explicit macOS-managed dynamic virtual memory indication; avoids misleading capacity caps or pressure percentages.

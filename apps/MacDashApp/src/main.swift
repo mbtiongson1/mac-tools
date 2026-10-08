@@ -19,6 +19,7 @@ struct AppMemoryUsage: Identifiable {
 
 struct SystemMetrics {
     var cpuUsage: Double = 0.0          // 0 - 100%
+    var cpuTemperatureCelsius: Double?
     var ramUsedBytes: Double = 0.0
     var ramTotalBytes: Double = Double(ProcessInfo.processInfo.physicalMemory)
     var swapUsedBytes: Double = 0.0
@@ -74,6 +75,7 @@ class MetricsSampler: ObservableObject {
             guard let self = self else { return }
 
             let cpu = self.sampleCPU()
+            let cpuTemperature = self.sampleCPUTemperature()
             let (ramUsed, load) = self.sampleRAMAndLoad()
             let swapUsed = self.sampleSwapUsage()
             let (diskUsed, diskTotal, diskFree) = self.sampleDiskSpace()
@@ -84,6 +86,7 @@ class MetricsSampler: ObservableObject {
 
             DispatchQueue.main.async {
                 self.metrics.cpuUsage = cpu
+                self.metrics.cpuTemperatureCelsius = cpuTemperature
                 self.metrics.ramUsedBytes = ramUsed
                 self.metrics.loadAverages = load
                 self.metrics.swapUsedBytes = swapUsed
@@ -127,6 +130,29 @@ class MetricsSampler: ObservableObject {
             return min(100.0, max(0.0, ((u + s + n) / total) * 100.0))
         }
         return 0.0
+    }
+
+    private func sampleCPUTemperature() -> Double? {
+        let candidates = ["/opt/homebrew/bin/macmon", "/usr/local/bin/macmon"]
+        guard let executable = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else { return nil }
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: executable)
+        task.arguments = ["pipe", "--samples", "1", "--interval", "250"]
+        let output = Pipe()
+        task.standardOutput = output
+        task.standardError = FileHandle.nullDevice
+        do {
+            try task.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            task.waitUntilExit()
+            guard task.terminationStatus == 0,
+                  let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let temperature = (root["temp"] as? [String: Any])?["cpu_temp_avg"] as? NSNumber else { return nil }
+            return temperature.doubleValue
+        } catch {
+            return nil
+        }
     }
 
     private func sampleRAMAndLoad() -> (Double, (Double, Double, Double)) {
@@ -434,6 +460,41 @@ struct MacDashPopoverView: View {
         }
     }
 
+    private var temperatureColor: Color {
+        guard let temperature = sampler.metrics.cpuTemperatureCelsius else { return .secondary }
+        if temperature >= 85 { return Color(nsColor: .systemRed) }
+        if temperature >= 70 { return Color(nsColor: .systemOrange) }
+        return Color(nsColor: .systemGreen)
+    }
+
+    private var temperatureHero: some View {
+        HStack(spacing: 12) {
+            GlassIcon(symbol: "thermometer.high", tint: temperatureColor, size: 21, diameter: 44)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("CPU TEMPERATURE")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .tracking(0.7)
+                    .foregroundStyle(.secondary)
+                Text(sampler.metrics.cpuTemperatureCelsius.map { String(format: "%.1f°C", $0) } ?? "— °C")
+                    .font(.system(size: 28, weight: .bold, design: .rounded).monospacedDigit())
+                    .foregroundStyle(temperatureColor)
+                    .contentTransition(.numericText())
+            }
+            Spacer(minLength: 8)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("CPU LOAD")
+                    .font(.system(size: 9, weight: .bold, design: .rounded))
+                    .tracking(0.6)
+                    .foregroundStyle(.secondary)
+                Text(String(format: "%.0f%%", sampler.metrics.cpuUsage))
+                    .font(.system(size: 17, weight: .semibold, design: .rounded).monospacedDigit())
+                    .contentTransition(.numericText())
+            }
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+    }
+
     private var headerView: some View {
         HStack(spacing: 9) {
             GlassIcon(symbol: "gauge.with.needle.fill", tint: Color(nsColor: .controlAccentColor), size: 15, diameter: 32)
@@ -690,6 +751,7 @@ struct MacDashPopoverView: View {
     var body: some View {
         VStack(spacing: 10) {
             headerView
+            temperatureHero
 
             Group {
                 if #available(macOS 26.0, *) {
@@ -761,11 +823,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let cpu = sampler.metrics.cpuUsage
-        let ram = sampler.metrics.ramPercentage
-
-        button.image = NSImage(systemSymbolName: "gauge.with.needle.fill", accessibilityDescription: "MacDash")
-        let title = String(format: " %.0f%% · %.0f%%", cpu, ram)
+        button.image = NSImage(systemSymbolName: "thermometer.medium", accessibilityDescription: "CPU temperature and swap used")
+        let temperature = sampler.metrics.cpuTemperatureCelsius.map { String(format: "%.0f°C", $0) } ?? "—°C"
+        let swap = formatBytes(sampler.metrics.swapUsedBytes)
+        let title = " \(temperature) · \(swap)"
         let attr = NSMutableAttributedString(string: title, attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .medium),
             .foregroundColor: NSColor.labelColor
