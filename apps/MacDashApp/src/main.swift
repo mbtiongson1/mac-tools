@@ -3,8 +3,18 @@ import Cocoa
 import Foundation
 import MachO
 import ServiceManagement
+import Darwin
 
 // MARK: - Models & Metrics Sampler
+
+struct AppMemoryUsage: Identifiable {
+    let pid: pid_t
+    let name: String
+    let bundleIdentifier: String?
+    let launchDate: Date?
+    let memoryBytes: Double
+    var id: pid_t { pid }
+}
 
 struct SystemMetrics {
     var cpuUsage: Double = 0.0          // 0 - 100%
@@ -12,7 +22,7 @@ struct SystemMetrics {
     var ramTotalBytes: Double = Double(ProcessInfo.processInfo.physicalMemory)
     var swapUsedBytes: Double = 0.0
     var swapTotalBytes: Double = 0.0
-    var gpuUsage: Double = 0.0          // 0 - 100%
+    var topApps: [AppMemoryUsage] = []
     var netDownloadRate: Double = 0.0   // bytes / sec
     var netUploadRate: Double = 0.0     // bytes / sec
     var thermalState: ProcessInfo.ThermalState = .nominal
@@ -24,10 +34,6 @@ struct SystemMetrics {
         return (ramUsedBytes / ramTotalBytes) * 100.0
     }
     
-    var swapPercentage: Double {
-        guard swapTotalBytes > 0 else { return 0 }
-        return (swapUsedBytes / swapTotalBytes) * 100.0
-    }
 }
 
 class MetricsSampler: ObservableObject {
@@ -53,13 +59,15 @@ class MetricsSampler: ObservableObject {
     }
     
     func sample() {
+        // NSWorkspace is AppKit state; snapshot its app list on the main thread.
+        let runningApps = NSWorkspace.shared.runningApplications
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             
             let cpu = self.sampleCPU()
             let (ramUsed, load) = self.sampleRAMAndLoad()
             let (swapUsed, swapTotal) = self.sampleSwapUsage()
-            let gpu = self.sampleGPU()
+            let apps = self.sampleTopApps(from: runningApps)
             let (rxRate, txRate) = self.sampleNetwork()
             let thermal = ProcessInfo.processInfo.thermalState
             let uptime = self.sampleUptime()
@@ -70,7 +78,7 @@ class MetricsSampler: ObservableObject {
                 self.metrics.loadAverages = load
                 self.metrics.swapUsedBytes = swapUsed
                 self.metrics.swapTotalBytes = swapTotal
-                self.metrics.gpuUsage = gpu
+                self.metrics.topApps = apps
                 self.metrics.netDownloadRate = rxRate
                 self.metrics.netUploadRate = txRate
                 self.metrics.thermalState = thermal
@@ -142,69 +150,48 @@ class MetricsSampler: ObservableObject {
         return (0.0, 0.0)
     }
     
-    private func sampleGPU() -> Double {
-        let task = Process()
-        task.launchPath = "/usr/sbin/ioreg"
-        task.arguments = ["-r", "-c", "IOAccelerator", "-d", "2"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-        do {
-            try task.run()
-            task.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            if let output = String(data: data, encoding: .utf8) {
-                let pattern = "Device Utilization %\"?=([0-9]+)"
-                if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
-                    let range = NSRange(output.startIndex..<output.endIndex, in: output)
-                    let matches = regex.matches(in: output, options: [], range: range)
-                    var vals: [Double] = []
-                    for match in matches {
-                        if match.numberOfRanges > 1, let r = Range(match.range(at: 1), in: output) {
-                            if let val = Double(output[r]) {
-                                vals.append(val)
-                            }
-                        }
-                    }
-                    if !vals.isEmpty {
-                        return vals.reduce(0, +) / Double(vals.count)
+    private func sampleTopApps(from runningApps: [NSRunningApplication]) -> [AppMemoryUsage] {
+        runningApps
+            .filter { $0.activationPolicy == .regular && $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+            .compactMap { app in
+                var usage = rusage_info_v4()
+                let result = withUnsafeMutablePointer(to: &usage) { pointer in
+                    pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { buffer in
+                        proc_pid_rusage(app.processIdentifier, RUSAGE_INFO_V4, buffer)
                     }
                 }
+                guard result == 0 else { return nil }
+                return AppMemoryUsage(pid: app.processIdentifier,
+                                      name: app.localizedName ?? app.bundleIdentifier ?? "Unknown App",
+                                      bundleIdentifier: app.bundleIdentifier,
+                                      launchDate: app.launchDate,
+                                      memoryBytes: Double(usage.ri_phys_footprint))
             }
-        } catch {}
-        return 0.0
+            .sorted { $0.memoryBytes > $1.memoryBytes }
+            .prefix(8)
+            .map { $0 }
     }
     
     private func sampleNetwork() -> (Double, Double) {
-        let task = Process()
-        task.launchPath = "/usr/bin/netstat"
-        task.arguments = ["-ib"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-        
+        var addresses: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addresses) == 0, let first = addresses else { return (0, 0) }
+        defer { freeifaddrs(addresses) }
+
         var rxTotal: Double = 0
         var txTotal: Double = 0
-        
-        do {
-            try task.run()
-            task.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            if let output = String(data: data, encoding: .utf8) {
-                let lines = output.components(separatedBy: .newlines)
-                for line in lines {
-                    if line.contains("<Link#") && !line.hasPrefix("lo0") {
-                        let parts = line.split(whereSeparator: { $0.isWhitespace })
-                        if parts.count >= 10 {
-                            if let rx = Double(parts[6]), let tx = Double(parts[9]) {
-                                rxTotal += rx
-                                txTotal += tx
-                            }
-                        }
-                    }
-                }
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let entry = cursor {
+            let interface = entry.pointee
+            if let address = interface.ifa_addr,
+               let data = interface.ifa_data?.assumingMemoryBound(to: if_data.self),
+               address.pointee.sa_family == UInt8(AF_LINK),
+               (interface.ifa_flags & UInt32(IFF_LOOPBACK)) == 0,
+               (interface.ifa_flags & UInt32(IFF_UP)) != 0 {
+                rxTotal += Double(data.pointee.ifi_ibytes)
+                txTotal += Double(data.pointee.ifi_obytes)
             }
-        } catch {}
+            cursor = interface.ifa_next
+        }
         
         let now = Date()
         var rxRate: Double = 0
@@ -213,8 +200,11 @@ class MetricsSampler: ObservableObject {
         if let lastRx = lastNetRx, let lastTx = lastNetTx, let lastTime = lastNetTime {
             let dt = now.timeIntervalSince(lastTime)
             if dt > 0 {
-                rxRate = max(0, (rxTotal - lastRx) / dt)
-                txRate = max(0, (txTotal - lastTx) / dt)
+                let counterModulus = Double(UInt32.max) + 1
+                let rxDelta = rxTotal >= lastRx ? rxTotal - lastRx : rxTotal + counterModulus - lastRx
+                let txDelta = txTotal >= lastTx ? txTotal - lastTx : txTotal + counterModulus - lastTx
+                rxRate = max(0, rxDelta / dt)
+                txRate = max(0, txDelta / dt)
             }
         }
         
@@ -333,6 +323,7 @@ struct AppleMetricRow: View {
 
 struct MacDashPopoverView: View {
     @ObservedObject var sampler: MetricsSampler
+    @State private var appToForceQuit: AppMemoryUsage?
     
     var thermalColor: Color {
         guard sampler.isMonitoringEnabled else { return Color.secondary.opacity(0.4) }
@@ -400,26 +391,79 @@ struct MacDashPopoverView: View {
                 )
                 
                 AppleMetricRow(
-                    title: "Swap",
-                    value: String(format: "%.1f%%", sampler.metrics.swapPercentage),
-                    percent: sampler.metrics.swapPercentage,
+                    title: "Swap Used",
+                    value: formatBytes(sampler.metrics.swapUsedBytes),
+                    percent: sampler.metrics.swapTotalBytes > 0 ? sampler.metrics.swapUsedBytes / sampler.metrics.swapTotalBytes * 100 : 0,
                     icon: "arrow.triangle.2.circlepath",
-                    detail: "\(formatBytes(sampler.metrics.swapUsedBytes)) used / \(formatBytes(sampler.metrics.swapTotalBytes)) total",
+                    detail: "of \(formatBytes(sampler.metrics.swapTotalBytes)) available",
                     isDisabled: !sampler.isMonitoringEnabled
                 )
                 
-                AppleMetricRow(
-                    title: "GPU",
-                    value: String(format: "%.0f%%", sampler.metrics.gpuUsage),
-                    percent: sampler.metrics.gpuUsage,
-                    icon: "display",
-                    detail: "Apple Silicon Metal Acceleration",
-                    isDisabled: !sampler.isMonitoringEnabled
-                )
             }
             .opacity(sampler.isMonitoringEnabled ? 1.0 : 0.45)
             .grayscale(sampler.isMonitoringEnabled ? 0.0 : 0.9)
             
+            Divider()
+
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    Label("Apps by Memory", systemImage: "memorychip")
+                        .font(.system(size: 11, weight: .semibold))
+                    Spacer()
+                    Text("PHYS. FOOTPRINT")
+                        .font(.system(size: 8, weight: .medium))
+                        .foregroundColor(.secondary)
+                }
+                ForEach(sampler.metrics.topApps.prefix(6)) { item in
+                    HStack(spacing: 7) {
+                        Image(systemName: "app.fill")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .frame(width: 15)
+                        Text(item.name)
+                            .font(.system(size: 10.5))
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
+                        Text(formatBytes(item.memoryBytes))
+                            .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                            .foregroundColor(.secondary)
+                        Button(appToForceQuit?.pid == item.pid ? "Confirm" : "Force Quit", role: .destructive) {
+                            if appToForceQuit?.pid == item.pid {
+                                if let app = NSRunningApplication(processIdentifier: item.pid),
+                                   app.bundleIdentifier == item.bundleIdentifier,
+                                   app.launchDate == item.launchDate {
+                                    _ = app.forceTerminate()
+                                }
+                                appToForceQuit = nil
+                                sampler.sample()
+                            } else {
+                                appToForceQuit = item
+                            }
+                        }
+                        .font(.system(size: 9, weight: .medium))
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .tint(.red)
+                        if appToForceQuit?.pid == item.pid {
+                            Button("Cancel") { appToForceQuit = nil }
+                                .font(.system(size: 9))
+                                .buttonStyle(.plain)
+                        }
+                    }
+                }
+                if sampler.metrics.topApps.isEmpty {
+                    Text("No app memory data available")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
+                if appToForceQuit != nil {
+                    Text("Unsaved changes may be lost.")
+                        .font(.system(size: 9))
+                        .foregroundColor(.red)
+                }
+            }
+            .opacity(sampler.isMonitoringEnabled ? 1.0 : 0.45)
+
             Divider()
             
             // Network & Thermal Card Grid
@@ -513,8 +557,8 @@ struct MacDashPopoverView: View {
             }
             .padding(.horizontal, 2)
         }
-        .padding(12)
-        .frame(width: 275)
+        .padding(14)
+        .frame(width: 370)
     }
 }
 
@@ -530,7 +574,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         
         let contentView = MacDashPopoverView(sampler: sampler)
-        popover.contentSize = NSSize(width: 275, height: 380)
+        popover.contentSize = NSSize(width: 370, height: 600)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: contentView)
         

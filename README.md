@@ -10,7 +10,7 @@ A collection of macOS menu bar applications, utility scripts, CLI monitors, and 
 mac-tools/
 ├── apps/
 │   ├── MacDashApp/           # Native macOS menu bar status dashboard (SwiftUI)
-│   │   ├── src/main.swift    # CPU, RAM, SWAP, GPU, Network, Thermal popover monitor
+│   │   ├── src/main.swift    # CPU, RAM, SWAP, per-app memory, Network, Thermal popover monitor
 │   │   ├── Info.plist        # Configured with LSUIElement=true (dock-hidden)
 │   │   └── build.sh          # One-click build, install, & launch-at-login script
 │   └── ToggleSleep/          # Native macOS menu bar app for toggling sleep/caffeine
@@ -37,14 +37,13 @@ mac-tools/
 A native macOS status bar monitor (`~/Applications/MacDash.app`) built with SwiftUI:
 - **Menu bar item**: Live text displaying `CPU % · RAM %` alongside SF Symbol `gauge.badge.bolt`.
 - **Popover card**: Clicking reveals an impeccably designed native dashboard HUD:
-  - **CPU**: Real-time percentage & load averages with color-coded gradient track.
-  - **RAM**: Memory utilization (active, wired, compressor vs total physical RAM).
-  - **SWAP**: Swap disk usage and allocation percentage.
-  - **GPU**: Apple Silicon Metal GPU device & accelerator utilization.
-  - **Network**: Real-time download & upload bandwidth rates (`KB/s`, `MB/s`).
+  - **CPU**: Real-time system CPU percentage & load averages with a color-coded usage track.
+  - **RAM**: Memory utilization (active, wired, compressor vs total physical RAM), plus top apps sorted by physical memory footprint.
+  - **SWAP**: Absolute swap used and available capacity; avoids presenting allocated swap capacity as a misleading pressure percentage.
+  - **Network**: Real-time download & upload bandwidth rates sampled from active non-loopback interfaces.
   - **Thermal Condition**: Apple Silicon thermal state indicators (`Nominal`, `Fair`, `Serious`, `Critical`).
   - **Uptime**: System uptime clock.
-  - **Quick Action**: Shortcut to macOS Activity Monitor.
+  - **Quick Actions**: Force-quit an app after inline confirmation, or open Activity Monitor.
 - **Build & Install**:
   ```bash
   cd apps/MacDashApp
