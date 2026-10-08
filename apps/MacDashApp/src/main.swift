@@ -27,6 +27,8 @@ struct SystemMetrics {
     var diskFreeBytes: Double = 0.0
     var topApps: [AppMemoryUsage] = []
     var netDownloadRate: Double = 0.0   // bytes / sec
+    var downloadHistory: [Double] = []
+    var uploadHistory: [Double] = []
     var netUploadRate: Double = 0.0     // bytes / sec
     var thermalState: ProcessInfo.ThermalState = .nominal
     var loadAverages: (Double, Double, Double) = (0.0, 0.0, 0.0)
@@ -91,6 +93,8 @@ class MetricsSampler: ObservableObject {
                 self.metrics.topApps = apps
                 self.metrics.netDownloadRate = rxRate
                 self.metrics.netUploadRate = txRate
+                self.metrics.downloadHistory = Array((self.metrics.downloadHistory + [rxRate]).suffix(60))
+                self.metrics.uploadHistory = Array((self.metrics.uploadHistory + [txRate]).suffix(60))
                 self.metrics.thermalState = thermal
                 self.metrics.uptimeString = uptime
             }
@@ -322,6 +326,32 @@ struct GlassIcon: View {
     }
 }
 
+struct NetworkSparkline: Shape {
+    let samples: [Double]
+    var closesToBaseline = false
+
+    func path(in rect: CGRect) -> Path {
+        guard samples.count > 1 else { return Path() }
+        let peak = max(samples.max() ?? 0, 1024)
+        let points = samples.enumerated().map { index, sample in
+            CGPoint(
+                x: rect.minX + rect.width * CGFloat(index) / CGFloat(samples.count - 1),
+                y: rect.maxY - rect.height * 0.9 * CGFloat(max(0, sample) / peak)
+            )
+        }
+        var path = Path()
+        guard let first = points.first, let last = points.last else { return path }
+        path.move(to: first)
+        for point in points.dropFirst() { path.addLine(to: point) }
+        if closesToBaseline {
+            path.addLine(to: CGPoint(x: last.x, y: rect.maxY))
+            path.addLine(to: CGPoint(x: first.x, y: rect.maxY))
+            path.closeSubpath()
+        }
+        return path
+    }
+}
+
 struct GlassMetricTile: View {
     let title: String
     let value: String
@@ -461,41 +491,67 @@ struct MacDashPopoverView: View {
         }
     }
 
+    private func networkRate(
+        title: String,
+        value: Double,
+        samples: [Double],
+        symbol: String,
+        tint: Color
+    ) -> some View {
+        ZStack(alignment: .leading) {
+            NetworkSparkline(samples: samples, closesToBaseline: true)
+                .fill(LinearGradient(
+                    colors: [tint.opacity(0.17), tint.opacity(0.01)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                ))
+                .overlay {
+                    NetworkSparkline(samples: samples)
+                        .stroke(tint.opacity(0.48), style: StrokeStyle(lineWidth: 1.3, lineCap: .round, lineJoin: .round))
+                }
+                .padding(.leading, 2)
+                .accessibilityHidden(true)
+
+            HStack(spacing: 8) {
+                GlassIcon(symbol: symbol, tint: tint, size: 14, diameter: 28)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title.uppercased())
+                        .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                        .tracking(0.6)
+                        .foregroundStyle(.secondary)
+                    Text(formatBytes(value, perSec: true))
+                        .font(.system(size: 12.5, weight: .bold, design: .rounded).monospacedDigit())
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 42, maxHeight: 42)
+        .clipped()
+    }
+
     private var networkRow: some View {
         HStack(spacing: 8) {
-            HStack(spacing: 8) {
-                GlassIcon(symbol: "arrow.down.circle.fill", tint: Color(nsColor: .systemTeal), size: 14, diameter: 28)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("DOWNLOAD")
-                        .font(.system(size: 9.5, weight: .bold, design: .rounded))
-                        .tracking(0.6)
-                        .foregroundStyle(.secondary)
-                    Text(formatBytes(sampler.metrics.netDownloadRate, perSec: true))
-                        .font(.system(size: 12.5, weight: .bold, design: .rounded).monospacedDigit())
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            networkRate(
+                title: "Download",
+                value: sampler.metrics.netDownloadRate,
+                samples: sampler.metrics.downloadHistory,
+                symbol: "arrow.down.circle.fill",
+                tint: Color(nsColor: .systemTeal)
+            )
 
             Divider()
-                .frame(height: 22)
+                .frame(height: 28)
                 .opacity(0.4)
 
-            HStack(spacing: 8) {
-                GlassIcon(symbol: "arrow.up.circle.fill", tint: Color(nsColor: .systemIndigo), size: 14, diameter: 28)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("UPLOAD")
-                        .font(.system(size: 9.5, weight: .bold, design: .rounded))
-                        .tracking(0.6)
-                        .foregroundStyle(.secondary)
-                    Text(formatBytes(sampler.metrics.netUploadRate, perSec: true))
-                        .font(.system(size: 12.5, weight: .bold, design: .rounded).monospacedDigit())
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            networkRate(
+                title: "Upload",
+                value: sampler.metrics.netUploadRate,
+                samples: sampler.metrics.uploadHistory,
+                symbol: "arrow.up.circle.fill",
+                tint: Color(nsColor: .systemIndigo)
+            )
         }
         .padding(.horizontal, 4)
         .padding(.vertical, 2)

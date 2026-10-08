@@ -41,7 +41,7 @@ A native macOS status bar monitor (`~/Applications/MacDash.app`) built with Swif
   - **RAM**: Memory utilization (active, wired, compressor vs total physical RAM), plus app icons and top apps sorted by physical memory footprint.
   - **Storage**: Real root volume capacity, available/free space, and utilization percentage with semantic health ring.
   - **SWAP**: Absolute swap used with explicit macOS-managed dynamic virtual memory indication; avoids misleading capacity caps or pressure percentages.
-  - **Network**: Real-time download & upload bandwidth rates sampled from active non-loopback interfaces in a compact Control Center-style row.
+  - **Network**: Real-time download & upload bandwidth rates with 60-sample, dynamically scaled sparklines, sampled from active non-loopback interfaces.
   - **Thermal Condition**: Apple Silicon thermal state and uptime in a compact status capsule.
   - **Uptime**: System uptime clock.
   - **Quick Actions**: Force-quit an app after inline confirmation, or open Activity Monitor.
