@@ -307,8 +307,18 @@ class DiskScanner:
                 if entry.is_symlink():
                     continue
 
+                # Skip virtual CloudStorage (e.g. Google Drive/iCloud virtual filesystem)
+                if "Library/CloudStorage" in entry.path:
+                    continue
+
                 if entry.is_file():
-                    sz = entry.stat().st_size
+                    st = entry.stat()
+                    # On macOS APFS, use st_blocks * 512 for physical disk allocation
+                    # to avoid counting dataless/cloud-evicted files.
+                    sz = getattr(st, "st_blocks", 0) * 512
+                    if sz == 0 and st.st_size > 0 and "CloudStorage" not in entry.path:
+                        # Fallback for non-block-based files under 512 bytes
+                        sz = st.st_size
                     node.size += sz
                     node.file_count += 1
                     cat = classify_file(entry.path)
