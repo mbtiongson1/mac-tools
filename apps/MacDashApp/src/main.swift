@@ -14,6 +14,7 @@ struct AppMemoryUsage: Identifiable {
     let launchDate: Date?
     let icon: NSImage
     let memoryBytes: Double
+    let isApp: Bool
     var id: pid_t { pid }
 }
 
@@ -202,24 +203,162 @@ class MetricsSampler: ObservableObject {
         return (0.0, 0.0, 0.0)
     }
 
+    private struct ProcessRawSnapshot {
+        let pid: pid_t
+        let ppid: pid_t
+        let name: String
+        let footprint: UInt64
+        let path: String
+    }
+
+    private func getAllProcesses() -> [ProcessRawSnapshot] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+        var size: Int = 0
+        guard sysctl(&mib, 4, nil, &size, nil, 0) == 0 else { return [] }
+        let count = size / MemoryLayout<kinfo_proc>.size
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: count)
+        guard sysctl(&mib, 4, &procs, &size, nil, 0) == 0 else { return [] }
+        let actualCount = size / MemoryLayout<kinfo_proc>.size
+
+        var entries: [ProcessRawSnapshot] = []
+        entries.reserveCapacity(actualCount)
+
+        var pathBuffer = [CChar](repeating: 0, count: 4096)
+        var usage = rusage_info_v4()
+
+        for i in 0..<actualCount {
+            let kp = procs[i]
+            let pid = kp.kp_proc.p_pid
+            guard pid > 0 else { continue }
+            let ppid = kp.kp_eproc.e_ppid
+
+            let res = withUnsafeMutablePointer(to: &usage) { ptr in
+                ptr.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { buf in
+                    proc_pid_rusage(pid, RUSAGE_INFO_V4, buf)
+                }
+            }
+            let footprint = (res == 0) ? usage.ri_phys_footprint : 0
+            guard footprint > 0 else { continue }
+
+            let pathLen = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
+            let path = pathLen > 0 ? String(cString: pathBuffer) : ""
+
+            let name = withUnsafeBytes(of: kp.kp_proc.p_comm) { rawPtr -> String in
+                guard let baseAddress = rawPtr.baseAddress?.assumingMemoryBound(to: CChar.self) else { return "" }
+                return String(cString: baseAddress)
+            }
+
+            entries.append(ProcessRawSnapshot(pid: pid, ppid: ppid, name: name, footprint: footprint, path: path))
+        }
+        return entries
+    }
+
     private func sampleTopApps(from runningApps: [NSRunningApplication]) -> [AppMemoryUsage] {
-        runningApps
-            .filter { $0.activationPolicy == .regular && $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
-            .compactMap { app in
-                var usage = rusage_info_v4()
-                let result = withUnsafeMutablePointer(to: &usage) { pointer in
-                    pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { buffer in
-                        proc_pid_rusage(app.processIdentifier, RUSAGE_INFO_V4, buffer)
+        let procs = getAllProcesses()
+        let currentPid = ProcessInfo.processInfo.processIdentifier
+
+        var procMap = [pid_t: ProcessRawSnapshot]()
+        for p in procs { procMap[p.pid] = p }
+
+        let regularApps = runningApps.filter { $0.activationPolicy == .regular && $0.processIdentifier != currentPid }
+        let regularPids = Set(regularApps.map { $0.processIdentifier })
+
+        var appByPid = [pid_t: NSRunningApplication]()
+        for app in runningApps { appByPid[app.processIdentifier] = app }
+
+        var appTotals = [pid_t: (app: NSRunningApplication, mem: UInt64)]()
+        var assignedPids = Set<pid_t>()
+
+        for app in regularApps {
+            let baseMem = procMap[app.processIdentifier]?.footprint ?? 0
+            appTotals[app.processIdentifier] = (app: app, mem: baseMem)
+            if baseMem > 0 { assignedPids.insert(app.processIdentifier) }
+        }
+
+        let safariApp = regularApps.first { $0.bundleIdentifier == "com.apple.Safari" }
+
+        for p in procs {
+            if assignedPids.contains(p.pid) || p.pid == currentPid { continue }
+
+            // Special case WebKit/Safari helper services
+            if let helperApp = appByPid[p.pid], let safari = safariApp {
+                if helperApp.bundleIdentifier?.hasPrefix("com.apple.WebKit") == true || (helperApp.localizedName ?? "").contains("Safari") {
+                    appTotals[safari.processIdentifier]?.mem += p.footprint
+                    assignedPids.insert(p.pid)
+                    continue
+                }
+            }
+
+            // Ancestry walk
+            var curr = p.ppid
+            var matchedAppPid: pid_t? = nil
+            var depth = 0
+            while curr > 1 && depth < 20 {
+                if regularPids.contains(curr) {
+                    matchedAppPid = curr
+                    break
+                }
+                if let parent = procMap[curr] {
+                    curr = parent.ppid
+                    depth += 1
+                } else {
+                    break
+                }
+            }
+
+            // Bundle path prefix match
+            if matchedAppPid == nil && !p.path.isEmpty {
+                for app in regularApps {
+                    if let bPath = app.bundleURL?.path, p.path.hasPrefix(bPath) {
+                        matchedAppPid = app.processIdentifier
+                        break
                     }
                 }
-                guard result == 0 else { return nil }
-                return AppMemoryUsage(pid: app.processIdentifier,
-                                      name: app.localizedName ?? app.bundleIdentifier ?? "Unknown App",
-                                      bundleIdentifier: app.bundleIdentifier,
-                                      launchDate: app.launchDate,
-                                      icon: app.icon ?? NSImage(systemSymbolName: "app.fill", accessibilityDescription: nil) ?? NSImage(),
-                                      memoryBytes: Double(usage.ri_phys_footprint))
             }
+
+            if let matched = matchedAppPid {
+                appTotals[matched]?.mem += p.footprint
+                assignedPids.insert(p.pid)
+            }
+        }
+
+        var results: [AppMemoryUsage] = []
+
+        // 1. Regular GUI apps with aggregated children/renderers
+        for (pid, info) in appTotals where info.mem > 0 {
+            let app = info.app
+            let name = app.localizedName ?? app.bundleIdentifier ?? "App"
+            let icon = app.icon ?? NSImage(systemSymbolName: "app.fill", accessibilityDescription: nil) ?? NSImage()
+            results.append(AppMemoryUsage(
+                pid: pid,
+                name: name,
+                bundleIdentifier: app.bundleIdentifier,
+                launchDate: app.launchDate,
+                icon: icon,
+                memoryBytes: Double(info.mem),
+                isApp: true
+            ))
+        }
+
+        // 2. High-memory standalone background / CLI / daemon processes (>= 50 MB)
+        let cliSymbol = NSImage(systemSymbolName: "terminal.fill", accessibilityDescription: nil) ?? NSImage()
+        let systemSymbol = NSImage(systemSymbolName: "gearshape.2.fill", accessibilityDescription: nil) ?? NSImage()
+
+        for p in procs where !assignedPids.contains(p.pid) && p.pid != currentPid {
+            guard p.footprint >= 50 * 1024 * 1024 else { continue }
+            let isSystem = p.path.hasPrefix("/System/") || p.path.hasPrefix("/usr/libexec/")
+            results.append(AppMemoryUsage(
+                pid: p.pid,
+                name: p.name.isEmpty ? (URL(fileURLWithPath: p.path).lastPathComponent) : p.name,
+                bundleIdentifier: nil,
+                launchDate: nil,
+                icon: isSystem ? systemSymbol : cliSymbol,
+                memoryBytes: Double(p.footprint),
+                isApp: false
+            ))
+        }
+
+        return results
             .sorted { $0.memoryBytes > $1.memoryBytes }
             .prefix(8)
             .map { $0 }
@@ -664,7 +803,7 @@ struct MacDashPopoverView: View {
     private var topAppsSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .firstTextBaseline) {
-                Label("Apps Using Memory", systemImage: "square.stack.3d.up.fill")
+                Label("Memory Consumers", systemImage: "square.stack.3d.up.fill")
                     .font(.system(size: 12.5, weight: .semibold, design: .rounded))
                 Spacer()
                 Text("TOP 5")
@@ -777,10 +916,13 @@ struct MacDashPopoverView: View {
     }
 
     private func forceQuit(_ item: AppMemoryUsage) {
-        if let app = NSRunningApplication(processIdentifier: item.pid),
+        if item.isApp,
+           let app = NSRunningApplication(processIdentifier: item.pid),
            app.bundleIdentifier == item.bundleIdentifier,
            app.launchDate == item.launchDate {
             _ = app.forceTerminate()
+        } else {
+            kill(item.pid, SIGKILL)
         }
         appToForceQuit = nil
         sampler.sample()

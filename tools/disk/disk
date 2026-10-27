@@ -1,0 +1,19 @@
+#!/bin/sh
+# Resolve symlinks to find the real script directory
+TARGET="$0"
+while [ -L "$TARGET" ]; do
+  DIR="$(cd -P "$(dirname "$TARGET")" >/dev/null 2>&1 && pwd)"
+  TARGET="$(readlink "$TARGET")"
+  [ "${TARGET#/}" = "$TARGET" ] && TARGET="$DIR/$TARGET"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$TARGET")" >/dev/null 2>&1 && pwd)"
+
+# If invoked from tools/disk, disk.py is in the same directory.
+# If invoked from bin/, disk.py is in ../tools/disk/.
+if [ -f "$SCRIPT_DIR/disk.py" ]; then
+  exec python3 "$SCRIPT_DIR/disk.py" "$@"
+elif [ -f "$SCRIPT_DIR/../tools/disk/disk.py" ]; then
+  exec python3 "$SCRIPT_DIR/../tools/disk/disk.py" "$@"
+else
+  exec python3 /Users/marcotiongson/mac-tools/tools/disk/disk.py "$@"
+fi
